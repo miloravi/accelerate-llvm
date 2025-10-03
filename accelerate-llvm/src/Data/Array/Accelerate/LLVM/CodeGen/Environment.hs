@@ -106,6 +106,9 @@ data Envs env idxEnv = Envs
   -- Whether the loop at the current loop depth is descending
   -- (iterating from high indices to low indices)
   , envsDescending :: Bool
+  -- The total number of tiles to be executed by all threads, if this is in a
+  -- parallel tiled loop
+  , envsTileCount :: Operand Int
   }
 
 initEnv
@@ -138,6 +141,7 @@ initEnv gamma shr idxLHS iterSize iterDir localsR localLHS
       , envsTileLocalIndex = OP_Int $ scalar scalarTypeInt 0
       , envsIsFirst = OP_Bool $ boolean True
       , envsDescending = False
+      , envsTileCount = integral TypeInt 0
       }
     , reverse $ loops shr idxVars iterSize iterDir
     )
