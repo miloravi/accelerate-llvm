@@ -44,6 +44,10 @@ import Data.Array.Accelerate.LLVM.CodeGen.Base
 import LLVM.AST.Type.Function
 import LLVM.AST.Type.Name
 
+-- For debugging
+import Data.Char (ord)
+
+
 -- | A standard 'for' loop, that steps from the start to end index executing the
 -- given function at each index.
 --
@@ -292,12 +296,19 @@ putchar :: Operands Int -> CodeGen Native (Operands Int)
 putchar x = call (lamUnnamed primType $ Body (PrimType primType) Nothing (Label "putchar")) 
                  (ArgumentsCons (op TypeInt x) [] ArgumentsNil) 
                  []
-putcharA, putcharB, putcharC, putcharD, putcharE, putcharF, putcharG, putcharH :: StateT s (CodeGen Native) ()
-putcharA = void $ lift $ putchar $ liftInt 65
-putcharB = void $ lift $ putchar $ liftInt 66
-putcharC = void $ lift $ putchar $ liftInt 67
-putcharD = void $ lift $ putchar $ liftInt 68
-putcharE = void $ lift $ putchar $ liftInt 69
-putcharF = void $ lift $ putchar $ liftInt 70
-putcharG = void $ lift $ putchar $ liftInt 71
-putcharH = void $ lift $ putchar $ liftInt 72
+putcharA, putcharB, putcharC, putcharD, putcharE, putcharF, putcharG, putcharH :: CodeGen Native ()
+putcharA = void $ putchar $ liftInt 65
+putcharB = void $ putchar $ liftInt 66
+putcharC = void $ putchar $ liftInt 67
+putcharD = void $ putchar $ liftInt 68
+putcharE = void $ putchar $ liftInt 69
+putcharF = void $ putchar $ liftInt 70
+putcharG = void $ putchar $ liftInt 71
+putcharH = void $ putchar $ liftInt 72
+
+
+putchar1 :: Char -> CodeGen Native ()
+putchar1 c = void $ putchar $ liftInt (ord c)
+
+putcharStr :: String -> CodeGen Native ()
+putcharStr cs = foldl (>>) (return ()) $ map putchar1 cs

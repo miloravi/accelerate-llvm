@@ -579,7 +579,6 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- reduced value so far. 'Handle' here means that we should now add the value
   -- of that block.
   memoryTp -- MemoryTp is now already primType 
-  
   -- Initialize kernel memory, use only the first value for now
   (\ptr envs -> do
     ptrs <- tuplePtrs' memoryTp ptr
@@ -618,7 +617,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       case identity of
         Nothing -> return ()
         Just identity' -> do
-          value <- llvmOfExp (compileArrayInstrEnvs envs) identity' -- Wtfrick is this
+          value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
           tupleStore tp accumVar value
   )
   -- Code within the tile loop
@@ -686,16 +685,23 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
           -- no need to wait
           return ()
         else do
-          _ <- Loop.while [] TupRunit
-            (\_ -> do
-              flag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx
-              A.neq singleType flag (A.liftWord8 2) -- Now only going when the previous tile has fully finished
-            )
-            (\_ -> return OP_Unit)
-            OP_Unit
-          _ <- instr' $ Fence (CrossThread, Acquire) -- Am I acquiring too much?
-          return ()
+          _ <- putchar (envsTileIndex envs)
 
+          A.unless (A.eq singleType (envsTileIndex envs) (A.liftInt 0))
+            ( do
+              -- First tile does not have to wait
+              _ <- Loop.while [] TupRunit
+                (\_ -> do
+                  prevIndex' <- prevIndex envs
+                  flag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray prevIndex' tileFlagidx
+                  A.neq singleType flag (A.liftWord8 2) -- Now only going when the previous tile has fully finished
+                )
+                (\_ -> return OP_Unit)
+                OP_Unit
+              return ()
+            )
+
+        _ <- instr' $ Fence (CrossThread, Acquire) -- Am I acquiring too much?
         local <- tupleLoad tp accumVar
 
         new <-
@@ -712,11 +718,8 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                 return local
               )
               (do
-                prevIndex <- A.sub numType (envsTileIndex envs) (A.liftInt 1)
-                prefix <- case prevIndex of 
-                  OP_Int index -> tupleLoadArray tp Volatile tileArray index prefixidx -- Should maybe be a helper function, since I use it twice
-                -- let prefix = case prevIndex of 
-                --   OP_Int index -> tupleLoadArray tp Volatile tileArray index prefixidx
+                prevIndex' <- prevIndex envs
+                prefix <- tupleLoadArray tp Volatile tileArray prevIndex' prefixidx 
 
                 tupleStore tp accumVar prefix
                 if envsDescending envs then
@@ -727,18 +730,17 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
           -- If there is a seed, then all tile will combine their local result with
           -- the already available value.
           else do
-            prevIndex <- A.sub numType (envsTileIndex envs) (A.liftInt 1)
-            prefix <- case prevIndex of 
-              OP_Int index -> tupleLoadArray tp Volatile tileArray index prefixidx
+            prevIndex' <- prevIndex envs
+            prefix <- tupleLoadArray tp Volatile tileArray prevIndex' prefixidx
             tupleStore tp accumVar prefix
             if envsDescending envs then
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
             else
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
         tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) prefixidx new -- maybe do both stores at once
+        tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx (A.liftWord8 2) -- Set the flag to 2 (prefix available)
 
         _ <- instr' $ Fence (CrossThread, Release) -- lowkey no clue what this does lmao, seems to be release what I acquired earlier but im not using instructions, maybe problematic
-        _ <- tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx (A.liftWord8 2) -- Set the flag to 2 (prefix available)
 
         return ()
   )
@@ -827,6 +829,11 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       return ()
     singleEnvIndex envs = case envsTileIndex envs of
       OP_Int idx -> idx
+    prevIndex envs = do
+      prevIndexOps <- A.sub numType (envsTileIndex envs) (A.liftInt 1)
+      case prevIndexOps of
+        OP_Int idx -> return idx
+
     arraySize :: Word64
     arraySize = 8192
 
