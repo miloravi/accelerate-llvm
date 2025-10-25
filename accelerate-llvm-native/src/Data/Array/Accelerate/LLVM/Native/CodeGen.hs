@@ -165,7 +165,7 @@ codegen name env cluster args
           sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
           OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
           tileCount <- instr' $ BitCast scalarType tileCount'
-  
+
 
           -- Make new env in which tile amount is known
           let envs'' = envs'{
@@ -384,7 +384,7 @@ parCodeGen descending (FlatOp (NScan dir)
     (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
     (_ :>: _ :>: IdxArgIdx _ inputIdx :>: _ :>: _))
   = case dir of
-      LeftToRight -> Just $ parCodeGenScanLookback descending IsScan fun (Just seed) input inputIdx
+      LeftToRight -> Just $ parCodeGenScanLookback descending IsScan fun (Just seed) input inputIdx -- Change this for testcase
         (\_ _ -> return ())
         (\envs result -> writeArray' envs output inputIdx result)
         (\_ _ -> return ())
@@ -588,17 +588,17 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
           loopAmount <- A.min singleType (A.liftInt (fromIntegral arraySize)) (OP_Int tileCount)
 
           imapFromStepTo [Loop.LoopNonEmpty] (A.liftInt 0) (A.liftInt 1) loopAmount (\(OP_Int idx) -> do
-            _ <- tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray idx tileFlagidx (A.liftWord8 0)
+            _ <- tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray idx tileFlagidx unfinishedFlag
             return ()
             )
           case seed of
             Nothing -> return ()
             Just s -> do
-              value <- llvmOfExp (compileArrayInstrEnvs envs) s 
+              value <- llvmOfExp (compileArrayInstrEnvs envs) s
               codeSeed envs value
               -- Set value of the first tile to seed 
               tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) prefixidx value  )
-  
+
   -- Initialize a thread
   (\_ _ -> tupleAlloca tp) -- Maak hier een thruple van
   -- Code before the tile loop
@@ -650,6 +650,8 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
           )
         codePost envs new
         tupleStore tp accumVar new
+
+
     else do
       -- Parallel mode.
       -- Execute the reduce-phase of a parallel chained scan here.
@@ -673,93 +675,107 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
               else
                 app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
             )
-      tupleStore tp accumVar new
-
+      -- Duplicate code
       ptrs <- tuplePtrs' memoryTp ptr
       case ptrs of
         TupRsingle tileArray -> do
-          tupleStoreArray tp Volatile tileArray (opsToOpInt $ envsTileIndex envs) reductionidx new
-
+          tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) reductionidx new
           _ <- instr' $ Fence (CrossThread, Release)
+          tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
+      -- Duplicate code ends
 
-          tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt $ envsTileIndex envs) tileFlagidx ( A.liftWord8 1 )
-
+      tupleStore tp accumVar new
   )
   -- Code after the tile loop
   (\singleThreaded accumVar ptr envs -> do
     ptrs <- tuplePtrs' memoryTp ptr
     case ptrs of
       TupRsingle tileArray -> do
-        newPrefix <- if singleThreaded then
+        newPrefix <- if singleThreaded then do
             -- It is our turn since we are in the sequential mode, no need to wait
+            -- putString "S\n"
             tupleLoad tp accumVar
           else do
             prevIndex <- indexMin1 (envsTileIndex envs)
-            firstFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt prevIndex) tileFlagidx
-            local <- tupleLoad tp accumVar
+            local <- tupleLoad tp accumVar -- the reduction
+            maybeStart <- case identity of
+              Just identity' -> do
+                value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
+                return (OP_Pair value word8True)
+              Nothing -> return (OP_Pair local word8False) -- local is used as a dummy value which is never used
+            let loopVartp = TupRpair (TupRpair (TupRsingle scalarTypeWord8) (TupRsingle scalarTypeInt)) (TupRpair tp (TupRsingle scalarTypeWord8)) -- scalarTypeWord8 in place of a boolean, 0 for stop looping, 1 for keep looping
 
-            let loopVartp = TupRpair (TupRpair (TupRsingle scalarTypeWord8) (TupRsingle scalarTypeInt)) tp
 
             result <- Loop.while [Loop.LoopNonEmpty] loopVartp
               (\loopVar -> do
-                let OP_Pair (OP_Pair currFlag _) _ = loopVar
+                let OP_Pair (OP_Pair keepLooping _) _ = loopVar
 
-                A.neq singleType currFlag (A.liftWord8 2) -- Keep looping until we find a flag of 2 (prefix available)
+                A.eq singleType keepLooping word8True -- If keepLooping is 1 (true), keep looping
               )
               (\loopVar -> do
                 case loopVar of
-                  OP_Pair (OP_Pair curFlag curIndex) curReduction -> do
-                    A.ifThenElse (loopVartp, A.eq singleType curFlag (A.liftWord8 2))
-                      (do -- flag is 2, Load prefix, and add it to loopVar before returning it
-                        
-                        _ <- instr' $ Fence (CrossThread, Acquire)
+                  OP_Pair (OP_Pair _ curIndex) (OP_Pair curReduction hasValue) -> do
 
+                    curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt curIndex) tileFlagidx
+                    _ <- instr' $ Fence (CrossThread, Acquire)
+
+
+                    A.ifThenElse (loopVartp, A.eq singleType curFlag prefixFlag)
+                      (do -- flag is 2, Load prefix, and add it to loopVar before returning it
                         prefix <- tupleLoadArray tp Volatile tileArray (opsToOpInt curIndex) prefixidx
-                        newReduction <-
-                          if envsDescending envs then
-                            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction prefix
-                          else
-                            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix curReduction
                         
-                        -- Do I need to store the accumVar here?
+                        newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
+                          (
+                            if envsDescending envs then
+                              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction prefix
+                            else
+                              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix curReduction
+                          )
+                          (return prefix)
 
                         tupleStore tp accumVar newReduction
+                        _ <- instr' $ Fence (CrossThread, Release) -- just in case?
 
-                        return $ OP_Pair (OP_Pair curFlag curIndex) newReduction
+                        return $ OP_Pair (OP_Pair word8False curIndex) (OP_Pair newReduction word8True)
 
                       )
-                      (A.ifThenElse (loopVartp, A.eq singleType curFlag (A.liftWord8 1))
-                        (do -- flag is 1, Load reduction, and add it to loopVar before returning it
-                            
-                          _ <- instr' $ Fence (CrossThread, Acquire)
+                      (A.ifThenElse (loopVartp, A.eq singleType curFlag reductionFlag)
+                        (do -- flag is 1, Load reduction, and add it to loopVar before returning it                          
+                            reduction <- tupleLoadArray tp Volatile tileArray (opsToOpInt curIndex) reductionidx
 
-                          reduction <- tupleLoadArray tp Volatile tileArray (opsToOpInt curIndex) reductionidx
-                          newReduction <-
-                            if envsDescending envs then
-                              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction reduction
-                            else
-                              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) reduction curReduction
-                          
-                          newIndex <- indexMin1 curIndex
-                          newFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt newIndex) tileFlagidx
+                            newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
+                              (
+                                if envsDescending envs then
+                                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction reduction
+                                else
+                                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) reduction curReduction
+                              )
+                              (return reduction)
 
+                            newIndex <- indexMin1 curIndex
 
-                          return $ OP_Pair (OP_Pair newFlag newIndex) newReduction
+                            return $ OP_Pair (OP_Pair word8True newIndex) (OP_Pair newReduction word8True)
                         )
-                        (do -- flag is 0, do nothing, we are waiting
-                          return loopVar
-                        )
+                        (do
+                          -- putcharStr "flag 0"
+                          return loopVar)
                       )
               )
-              ( OP_Pair (OP_Pair firstFlag prevIndex) local 
+              ( OP_Pair (OP_Pair word8True prevIndex) maybeStart
               )
-            let OP_Pair _ prefix = result
-            return prefix
-        
+            let OP_Pair _ (OP_Pair prefix _) = result
+            -- Apply the prefix to our local reduction
+            ( if envsDescending envs then
+                    app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
+                  else
+                    app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
+                )
+
+
         tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) prefixidx newPrefix
 
         _ <- instr' $ Fence (CrossThread, Release)
-        tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx (A.liftWord8 2) -- Set the flag to 2 (prefix available)
+        tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
 
         return ()
   )
@@ -829,11 +845,8 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       = Just $ mkConstant tp v
       | otherwise
       = Nothing
-    -- tileFlagidx :: TupleIdx ((Word8, e), e) Word8
     tileFlagidx = tupleLeft (tupleLeft TupleIdxSelf)
-    -- reductionidx :: TupleIdx ((Word8, e), e) e
-    reductionidx = tupleRight (tupleLeft TupleIdxSelf) -- will be used for decoupled lookback, just not now
-    -- prefixidx :: TupleIdx ((Word8, e), e) e
+    reductionidx = tupleRight (tupleLeft TupleIdxSelf)
     prefixidx = tupleRight TupleIdxSelf
     singleEnvIndex envs = case envsTileIndex envs of
       OP_Int idx -> idx
@@ -841,6 +854,16 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
     opsToOpInt (OP_Int i) = i
     arraySize :: Word64 -- Temporary array size, should be circular eventually
     arraySize = 8192
+    unfinishedFlag :: Operands Word8
+    unfinishedFlag = A.liftWord8 0
+    reductionFlag :: Operands Word8
+    reductionFlag = A.liftWord8 1
+    prefixFlag :: Operands Word8
+    prefixFlag = A.liftWord8 2
+    word8True :: Operands Word8 -- These should be booleans eventually, but for now word8 works
+    word8True = A.liftWord8 1
+    word8False :: Operands Word8
+    word8False = A.liftWord8 0
 
 
 parCodeGenScan

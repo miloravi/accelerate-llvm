@@ -47,6 +47,7 @@ import LLVM.AST.Type.Name
 
 -- For debugging
 import Data.Char (ord)
+import Unsafe.Coerce (unsafeCoerce) -- temporary
 
 
 -- | A standard 'for' loop, that steps from the start to end index executing the
@@ -259,7 +260,7 @@ chunkCount :: ShapeR sh -> Operands sh -> Operands sh -> CodeGen Native (Operand
 chunkCount ShapeRz OP_Unit OP_Unit = return OP_Unit
 chunkCount (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair chunkSh chunkSz) = do
   counts <- chunkCount shr sh chunkSh
-  
+
   -- Compute ceil(sz / chunkSz), as
   -- (sz + chunkSz - 1) `quot` chunkSz
   chunkszsub1 <- sub numType chunkSz $ liftInt 1
@@ -307,8 +308,11 @@ putInt :: Operands Int -> CodeGen Native ()
 putInt x = void $ printf "%d" (op TypeInt x)
 
 putchar :: Operands Int -> CodeGen Native (Operands Int)
-putchar x = call (lamUnnamed primType $ Body (PrimType primType) Nothing (Label "putchar")) 
-                 (ArgumentsCons (op TypeInt x) [] ArgumentsNil) 
+putchar x = call (lamUnnamed primType $ Body (PrimType primType) Nothing (Label "putchar"))
+                 (ArgumentsCons (op TypeInt x) [] ArgumentsNil)
                  []
 putString :: String -> CodeGen Native ()
 putString str = foldl (>>) (return ()) (map (void . putchar . liftInt . fromEnum) str)
+
+unsafePrintInt :: Operands e -> CodeGen Native ()
+unsafePrintInt = putInt . unsafeCoerce
