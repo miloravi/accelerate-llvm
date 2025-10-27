@@ -700,7 +700,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
             -- Store the local result in the tile array
             tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local
             _ <- instr' $ Fence (CrossThread, Release)
-            tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
+            tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
 
             prevIndex <- indexMin1 (envsTileIndex envs)
             maybeStart <- case identity of
@@ -721,13 +721,13 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                 case loopVar of
                   OP_Pair (OP_Pair _ curIndex) (OP_Pair curReduction hasValue) -> do
 
-                    curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (opsToOpInt curIndex) tileFlagidx
+                    curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt curIndex) tileFlagidx
                     _ <- instr' $ Fence (CrossThread, Acquire)
 
 
                     A.ifThenElse (loopVartp, A.eq singleType curFlag prefixFlag)
                       (do -- flag is 2, Load prefix, and add it to loopVar before returning it
-                        prefix <- tupleLoadArray tp Volatile tileArray (opsToOpInt curIndex) prefixidx
+                        prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt curIndex) prefixidx
 
                         newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
                           (
@@ -745,7 +745,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                       )
                       (A.ifThenElse (loopVartp, A.eq singleType curFlag reductionFlag)
                         (do -- flag is 1, Load reduction, and add it to loopVar before returning it                          
-                            reduction <- tupleLoadArray tp Volatile tileArray (opsToOpInt curIndex) reductionidx
+                            reduction <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt curIndex) reductionidx
 
                             newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
                               (
