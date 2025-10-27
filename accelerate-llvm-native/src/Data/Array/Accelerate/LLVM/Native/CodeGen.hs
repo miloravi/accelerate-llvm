@@ -116,7 +116,7 @@ codegen name env cluster args
                   -- first tile loop (the reduce step of the chained scan) are
                   -- still in the cache during the second tile loop (the scan
                   -- step of the chained scan).
-                  4 -- only for debugging
+                  1024 * 2 -- only for debugging
                 else
                   1024 * 16 -- TODO: Implement a better heuristic to choose the tile size
 
@@ -596,7 +596,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
           let tileCount = envsTileCount envs
           loopAmount <- A.min singleType (A.liftInt (fromIntegral arraySize)) (OP_Int tileCount)
           imapFromStepTo [Loop.LoopNonEmpty] (A.liftInt 0) (A.liftInt 1) loopAmount (\(OP_Int idx) -> do
-            _ <- tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray idx tileFlagidx unfinishedFlag
+            _ <- tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray idx tileFlagidx unfinishedFlag
             return ()
             )
           case seed of
@@ -604,7 +604,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
             Just s -> do
               value <- llvmOfExp (compileArrayInstrEnvs envs) s
               codeSeed envs value
-              tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) prefixidx value  )
+              tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx value  )
 
   -- Initialize a thread
   (\_ _ -> tupleAlloca tp)
@@ -618,7 +618,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
         TupRsingle tileArray -> do -- Memory access
           prevIndex <- indexMin1 (envsTileIndex envs)
           safePrevIndex <- A.max singleType (A.liftInt 0) prevIndex
-          prefix <- tupleLoadArray tp Volatile tileArray (opsToOpInt safePrevIndex) prefixidx
+          prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt safePrevIndex) prefixidx
 
           tupleStore tp accumVar prefix
         --   -- Note: on the first tile, we read an undefined value if there is no
@@ -698,7 +698,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
             return local
           else do
             -- Store the local result in the tile array
-            tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) reductionidx local
+            tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local
             _ <- instr' $ Fence (CrossThread, Release)
             tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
 
@@ -721,7 +721,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                 case loopVar of
                   OP_Pair (OP_Pair _ curIndex) (OP_Pair curReduction hasValue) -> do
 
-                    curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt curIndex) tileFlagidx
+                    curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (opsToOpInt curIndex) tileFlagidx
                     _ <- instr' $ Fence (CrossThread, Acquire)
 
 
@@ -775,7 +775,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                     app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
                 )
 
-        tupleStoreArray tp Volatile tileArray (singleEnvIndex envs) prefixidx newPrefix
+        tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx newPrefix
         _ <- instr' $ Fence (CrossThread, Release)
         tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
 
@@ -788,7 +788,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       TupRsingle tileArray -> do
         lastIndex <- indexMin1 $ OP_Int (envsTileCount envs)
 
-        value <- tupleLoadArray tp Volatile tileArray (opsToOpInt lastIndex) prefixidx
+        value <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt lastIndex) prefixidx
 
         codeEnd envs value
   )
