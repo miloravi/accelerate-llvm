@@ -857,7 +857,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
     indexMin1 idx = A.sub numType idx (A.liftInt 1)
     opsToOpInt (OP_Int i) = i
     arraySize :: Word64 -- Temporary array size, should be circular eventually
-    arraySize = 8192
+    arraySize = 32768
     unfinishedFlag :: Operands Word8
     unfinishedFlag = A.liftWord8 0
     reductionFlag :: Operands Word8
