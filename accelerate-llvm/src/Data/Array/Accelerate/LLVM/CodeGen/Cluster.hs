@@ -262,7 +262,7 @@ parCodeGens' g depth = \case
             (\_ _ -> return ())
             (\_ _ _ _ -> return ())
             (\_ _ _ _ -> return ())
-            (\_ _ _ _ -> return ())
+            (\_ _ _ _ -> return (boolean False)) -- Temporarily true, should not always be true
             (\_ _ _ -> return ())
             (\_ envs -> code envs)
             Nothing
@@ -275,7 +275,7 @@ parCodeGens' g depth = \case
             (\_ _ -> return ())
             (\_ _ _ _ -> return ())
             (\_ _ _ envs -> code envs)
-            (\_ _ _ _ -> return ())
+            (\_ _ _ _ -> return (boolean False)) -- Temporarily true, should not always be true
             (\_ _ _ -> return ())
             (\_ _ -> return ())
             Nothing
@@ -366,7 +366,7 @@ data ParLoopCodeGen target env idxEnv kernelMemory where
     -- Code within the tile loop
     -> (Bool -> a -> Operand (Ptr (Struct kernelMemory)) -> Envs env idxEnv -> CodeGen target ())
     -- Code after the tile loop
-    -> (Bool -> a -> Operand (Ptr (Struct kernelMemory)) -> Envs env idxEnv -> CodeGen target ())
+    -> (Bool -> a -> Operand (Ptr (Struct kernelMemory)) -> Envs env idxEnv -> CodeGen target (Operand Bool)) -- TODO: returns whether the half-sized is completed
     -- Code when the thread stops working on this row.
     -> (a -> Operand (Ptr (Struct kernelMemory)) -> Envs env idxEnv -> CodeGen target ())
     -- Code after a row, *executed once*, by only one thread, per row
@@ -460,7 +460,7 @@ data ParTileLoop target op env idxEnv where
     { ptPeel   :: Bool
     , ptBefore :: (Envs env idxEnv -> CodeGen target ())
     , ptIn     :: OpCodeGens target op env idxEnv
-    , ptAfter  :: (Envs env idxEnv -> CodeGen target ())
+    , ptAfter  :: (Envs env idxEnv -> CodeGen target (Operand Bool)) -- TODO: Return things to false true
     } -> ParTileLoop target op env idxEnv
 
 data ParTileLoops target op env idxEnv where
@@ -474,7 +474,7 @@ data ParTileLoops target op env idxEnv where
     } -> ParTileLoops target op env idxEnv
 
 emptyParTileLoop :: ParTileLoop target op env idxEnv
-emptyParTileLoop = ParTileLoop False (\_ -> return ()) GenNil (\_ -> return ())
+emptyParTileLoop = ParTileLoop False (\_ -> return ()) GenNil (\_ -> return (boolean True))
 
 genParallel
   :: Operand (Ptr (Struct memoryFull))
@@ -523,12 +523,18 @@ genParallel ptr envs tupleIdx = \case
           (peel || ptPeel loop)
           (\e -> before False a thisPtr e >> ptBefore loop e)
           (GenOp (depth + 1) (OpCodeGenSingle $ body False a thisPtr) $ ptIn loop)
-          (\e -> after False a thisPtr e >> ptAfter loop e)
+          (\e -> do
+            opBool <- after False a thisPtr e
+            _ <- ptAfter loop e
+            return opBool)
     let loopSeq' = ParTileLoop
           (peel || ptPeel loopSeq)
           (\e -> before True a thisPtr e >> ptBefore loopSeq e)
           (GenOp (depth + 1) (OpCodeGenSingle $ body True a thisPtr) $ ptIn loopSeq)
-          (\e -> after True a thisPtr e >> ptAfter loopSeq e)
+          (\e -> do
+            opBool <- after True a thisPtr e
+            _ <- ptAfter loopSeq e
+            return opBool)
     let exit' = \e -> exit a thisPtr e >> exitNext e
     let loops' = case nextLoop of
           Nothing -> loops
@@ -568,6 +574,16 @@ genParallel ptr envs tupleIdx = \case
           envsIdx = partialEnvSkipLHS lhs $ envsIdx envs1
         }
 
+    withSkippedEnvBool
+      :: ELeftHandSide t idxEnv1 idxEnv2
+      -> (Envs env idxEnv2 -> CodeGen target (Operand Bool)) -- TODO: Operand bool stuff
+      -> Envs env idxEnv1
+      -> CodeGen target (Operand Bool)
+    withSkippedEnvBool lhs f envs1 =
+      f envs1{
+          envsIdx = partialEnvSkipLHS lhs $ envsIdx envs1
+        }
+
     loopSkippedEnv
       :: LoopDepth
       -> ELeftHandSide t idxEnv1 idxEnv2
@@ -578,15 +594,26 @@ genParallel ptr envs tupleIdx = \case
       ParTileLoop peel
         (withSkippedEnv lhs before)
         (GenBind d lhs expr body)
-        (withSkippedEnv lhs after)
+        (withSkippedEnvBool lhs after)
 
     withExtendedEnv
       :: ELeftHandSide t idxEnv1 idxEnv2
       -> Operands t
-      -> (Envs env idxEnv2 -> CodeGen target ())
+      -> (Envs env idxEnv2 -> CodeGen target ()) -- TODO: Maybe don't make f always return operand bool
       -> Envs env idxEnv1
       -> CodeGen target ()
     withExtendedEnv lhs value f envs1 =
+      f envs1{
+          envsIdx = envsIdx envs1 `pushIdxEnv` (lhs, value)
+        }
+
+    withExtendedEnvBool
+      :: ELeftHandSide t idxEnv1 idxEnv2
+      -> Operands t
+      -> (Envs env idxEnv2 -> CodeGen target (Operand Bool)) -- TODO: Maybe don't make f always return operand bool
+      -> Envs env idxEnv1
+      -> CodeGen target (Operand Bool)
+    withExtendedEnvBool lhs value f envs1 =
       f envs1{
           envsIdx = envsIdx envs1 `pushIdxEnv` (lhs, value)
         }
@@ -605,4 +632,4 @@ genParallel ptr envs tupleIdx = \case
         -- reevaluate the expression
         -- (const $ return value)
         (GenBind (d + 1) lhs (\_ -> return value) body)
-        (withExtendedEnv lhs value after)
+        (withExtendedEnvBool lhs value after)
