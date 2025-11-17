@@ -73,6 +73,11 @@ import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
 import qualified Text.LLVM as LP
 import Data.Array.Accelerate.LLVM.CodeGen.Loop (imapFromStepTo)
+-- Imports for half-sized
+import LLVM.AST.Type.Operand (Operand)
+
+-- Temporary imports for debugging
+
 
 codegen :: String
         -> Env AccessGroundR env
@@ -116,7 +121,7 @@ codegen name env cluster args
                   -- first tile loop (the reduce step of the chained scan) are
                   -- still in the cache during the second tile loop (the scan
                   -- step of the chained scan).
-                  1024 * 2 -- only for debugging
+                  4 -- only for debugging
                 else
                   1024 * 16 -- TODO: Implement a better heuristic to choose the tile size
 
@@ -192,7 +197,7 @@ codegen name env cluster args
           -- only used in one tile loop. These arrays can also be stored as a
           -- single value.
           envs''' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs''
-          workassistLoop workassistIndex workassistFirstIndex tileCount $ \seqMode tileIdx' -> do
+          workassistLoop workassistIndex workassistFirstIndex tileCount $ \seqMode tileIdx' -> do -- TODO: Hier kijken welke tiles je gerbuikt
             tileIdx <- instr' $ BitCast scalarType tileIdx'
 
             tileIdxAbsolute <-
@@ -248,11 +253,12 @@ codegen name env cluster args
                       envsTileLocalIndex = localIdx
                     }
                   genSequential envs''''' loops' $ ptIn tileLoop
-                ptAfter tileLoop envs''''
+                _ <- ptAfter tileLoop envs''''
                 return OP_Unit
               )
               -- Parallel mode
               (do
+                -- Hier de vorige environment opslaan
                 forM_ ((True, ptFirstLoop tileLoops) : map (False, ) (ptOtherLoops tileLoops)) $ \(isFirstTileLoop, tileLoop) -> do
                   -- All nested loops are placed in the first tile loop by parCodeGens
                   let loops'' = if isFirstTileLoop then loops' else []
@@ -275,7 +281,7 @@ codegen name env cluster args
                         -- know that each tile is non-empty.
                         ++ [ Loop.LoopNonEmpty ]
 
-                  ptBefore tileLoop envs''''
+                  ptBefore tileLoop envs'''' -- The pre-tile loop
                   Loop.loopWith ann (isDescending direction) lower upper $ \isFirst idx -> do
                     localIdx <- A.sub numType idx lower
                     let envs''''' = envs''''{
@@ -284,8 +290,9 @@ codegen name env cluster args
                         envsIsFirst = isFirst,
                         envsTileLocalIndex = localIdx
                       }
-                    genSequential envs''''' loops'' $ ptIn tileLoop
-                  ptAfter tileLoop envs''''
+                    genSequential envs''''' loops'' $ ptIn tileLoop -- The tile loop
+                  testingVar <- ptAfter tileLoop envs'''' -- TODO: Hier kan ik mn operand bool terugkrijgen (vooral voor 2 verschillende versies ofz, is verwarrend)
+                  return ()
                 return OP_Unit
               )
             return ()
@@ -504,7 +511,7 @@ parCodeGenFoldCommutative _ fun seed identity input output inputIdx outputIdx = 
     tupleStore tp accumVar new
   )
   -- Code after the tile loop
-  (\_ _ _ _ -> return ())
+  (\_ _ _ _ -> return (boolean True)) -- returning true should be fine I think
   -- Code at the end of a thread
   (\accumVar ptr envs -> do
     ptrs <- tuplePtrs memoryTp ptr
@@ -607,178 +614,206 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
               tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx value  )
 
   -- Initialize a thread
-  (\_ _ -> tupleAlloca tp)
+  (\_ _ -> do
+    threadMemPtr <- hoistAlloca threadTp
+    threadMem <- threadPtrToMem threadMemPtr
+    case threadMem of
+      TupRpair _ (TupRpair _ (TupRpair _ hasPrevTile)) -> do
+        _ <- tupleStore (TupRsingle scalarTypeWord8) hasPrevTile word8False -- no previous tile yet
+        return ()
+      _ -> internalError "threadMemory impossible"
+    
+    return threadMemPtr
+    -- tupleAlloca (TupRpair (tp) (TupRpair (TupRsingle scalarTypeInt) (TupRsingle scalarTypeWord8)))
+  )
   -- Code before the tile loop
-  (\singleThreaded accumVar ptr envs ->
-    if singleThreaded then do
-      -- In the single threaded mode, we directly do a scan over this tile,
-      -- instead of the reduce, lookback and scan phases.
-      ptrs <- tuplePtrs' memoryTp ptr
-      case ptrs of
-        TupRsingle tileArray -> do -- Memory access
-          prevIndex <- indexMin1 (envsTileIndex envs)
-          safePrevIndex <- A.max singleType (A.liftInt 0) prevIndex
-          prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt safePrevIndex) prefixidx
+  (\singleThreaded threadMemPtr ptr envs -> do
+    threadMem <- threadPtrToMem threadMemPtr
+    case threadMem of
+      TupRpair accumVar _ -> do
+        if singleThreaded then do
+          -- In the single threaded mode, we directly do a scan over this tile,
+          -- instead of the reduce, lookback and scan phases.
+          ptrs <- tuplePtrs' memoryTp ptr
+          case ptrs of
+            TupRsingle tileArray -> do -- Memory access
+              prevIndex <- indexMin1 (envsTileIndex envs)
+              safePrevIndex <- A.max singleType (A.liftInt 0) prevIndex
+              prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt safePrevIndex) prefixidx
 
-          tupleStore tp accumVar prefix
-        --   -- Note: on the first tile, we read an undefined value if there is no
-        --   -- seed. This is fine, as we don't use this value in the tile loop.
-    else
-      case identity of
-        Nothing -> return ()
-        Just identity' -> do
-          value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
-          tupleStore tp accumVar value
+              tupleStore tp accumVar prefix
+            --   -- Note: on the first tile, we read an undefined value if there is no
+            --   -- seed. This is fine, as we don't use this value in the tile loop.
+        else
+          case identity of
+            Nothing -> return ()
+            Just identity' -> do
+              value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
+              tupleStore tp accumVar value
+      _ -> internalError "threadMemory impossible"
 
   )
   -- Code within the tile loop
-  (\singleThreaded accumVar _ envs ->
-    if singleThreaded then do
-      -- Single threaded mode. We directly perform a scan here.
-      x <- readArray' envs input index
-      if isJust seed then do
-        accum <- tupleLoad tp accumVar
-        codePre envs accum
-        new <- if envsDescending envs then
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-        else
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        codePost envs new
-        tupleStore tp accumVar new
-      else do
-        isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
-        new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
-          ( do
-            return x
-          )
-          ( do
+  (\singleThreaded threadMemPtr _ envs -> do
+    threadMem <- threadPtrToMem threadMemPtr
+    case threadMem of
+      TupRpair accumVar _ -> do
+        if singleThreaded then do
+          -- Single threaded mode. We directly perform a scan here.
+          x <- readArray' envs input index
+          if isJust seed then do
             accum <- tupleLoad tp accumVar
             codePre envs accum
-            if envsDescending envs then
+            new <- if envsDescending envs then
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
             else
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-          )
-        codePost envs new
-        tupleStore tp accumVar new
-    else do
-
-      -- Parallel mode.
-      -- Execute the reduce-phase of a parallel chained scan here.
-      x <- readArray' envs input index
-      new <-
-        if isJust identity then do
-          accum <- tupleLoad tp accumVar
-          if envsDescending envs then
-            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-          else
-            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        else
-          A.ifThenElse' (tp, envsIsFirst envs)
-            ( do
-              return x
-            )
-            ( do
+            codePost envs new
+            tupleStore tp accumVar new
+          else do
+            isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
+            new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
+              ( do
+                return x
+              )
+              ( do
+                accum <- tupleLoad tp accumVar
+                codePre envs accum
+                if envsDescending envs then
+                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
+                else
+                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+              )
+            codePost envs new
+            tupleStore tp accumVar new
+        else do
+          -- Parallel mode.
+          -- Execute the reduce-phase of a parallel chained scan here.
+          x <- readArray' envs input index
+          new <-
+            if isJust identity then do
               accum <- tupleLoad tp accumVar
               if envsDescending envs then
                 app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
               else
                 app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-            )
+            else
+              A.ifThenElse' (tp, envsIsFirst envs)
+                ( do
+                  return x
+                )
+                ( do
+                  accum <- tupleLoad tp accumVar
+                  if envsDescending envs then
+                    app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
+                  else
+                    app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+                )
 
-      tupleStore tp accumVar new
+          tupleStore tp accumVar new
+      _ -> internalError "threadMemory impossible"
   )
   -- Code after the tile loop
-  (\singleThreaded accumVar ptr envs -> do
-    ptrs <- tuplePtrs' memoryTp ptr
-    local <- tupleLoad tp accumVar
-    case ptrs of
-      TupRsingle tileArray -> do
-        newPrefix <- if singleThreaded then do
-            return local
-          else do
-            -- Store the local result in the tile array
-            tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local
-            _ <- instr' $ Fence (CrossThread, Release)
-            tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
+  (\singleThreaded threadMemPtr ptr envs -> do -- TODO: hierin true returnen als deze is afgerond, en false als die niet is afgerond?
+    threadMem <- threadPtrToMem threadMemPtr
+    case threadMem of
+      TupRpair accumVar _ -> do
+        ptrs <- tuplePtrs' memoryTp ptr
+        local <- tupleLoad tp accumVar
+        case ptrs of
+          TupRsingle tileArray -> do
+            newPrefix <- if singleThreaded then do
+                return local
+              else do
+                -- Store the local result in the tile array
+                tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local
+                _ <- instr' $ Fence (CrossThread, Release)
+                tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
 
-            prevIndex <- indexMin1 (envsTileIndex envs)
-            maybeStart <- case identity of
-              Just identity' -> do
-                value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
-                return (OP_Pair value word8True)
-              Nothing -> return (OP_Pair local word8False) -- local is used as a dummy value which is never used
-            let loopVartp = TupRpair (TupRpair (TupRsingle scalarTypeWord8) (TupRsingle scalarTypeInt)) (TupRpair tp (TupRsingle scalarTypeWord8)) -- scalarTypeWord8 in place of a boolean, 0 for stop looping, 1 for keep looping
-
-
-            result <- Loop.while [Loop.LoopNonEmpty] loopVartp
-              (\loopVar -> do
-                let OP_Pair (OP_Pair keepLooping _) _ = loopVar
-
-                A.eq singleType keepLooping word8True -- If keepLooping is 1 (true), keep looping
-              )
-              (\loopVar -> do
-                case loopVar of
-                  OP_Pair (OP_Pair _ curIndex) (OP_Pair curReduction hasValue) -> do
-
-                    curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt curIndex) tileFlagidx
-                    _ <- instr' $ Fence (CrossThread, Acquire)
+                prevIndex <- indexMin1 (envsTileIndex envs)
+                -- tupleStore (TupRsingle scalarTypeInt) prevIdx prevIndex  --TODO: Remove this
+                maybeStart <- case identity of
+                  Just identity' -> do
+                    value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
+                    return (OP_Pair value word8True)
+                  Nothing -> return (OP_Pair local word8False) -- local is used as a dummy value which is never used
+                let loopVartp = TupRpair 
+                                  (TupRpair (TupRsingle scalarTypeWord8) (TupRsingle scalarTypeInt)) -- (flag, index)
+                                  (TupRpair tp (TupRsingle scalarTypeWord8)) -- (reduction, (hasValue, isPrevBlock)) scalarTypeWord8 in place of a boolean, 0 for stop looping, 1 for keep looping
 
 
-                    A.ifThenElse (loopVartp, A.eq singleType curFlag prefixFlag)
-                      (do -- flag is 2, Load prefix, and add it to loopVar before returning it
-                        prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt curIndex) prefixidx
+                result <- Loop.while [Loop.LoopNonEmpty] loopVartp
+                  (\loopVar -> do
+                    let OP_Pair (OP_Pair keepLooping _) _ = loopVar
 
-                        newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
-                          (
-                            if envsDescending envs then
-                              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction prefix
-                            else
-                              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix curReduction
-                          )
-                          (return prefix)
+                    A.eq singleType keepLooping word8True -- If keepLooping is 1 (true), keep looping
+                  )
+                  (\loopVar -> do
+                    case loopVar of
+                      OP_Pair (OP_Pair _ curIndex) (OP_Pair curReduction hasValue) -> do
 
-                        tupleStore tp accumVar newReduction
+                        curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt curIndex) tileFlagidx
+                        _ <- instr' $ Fence (CrossThread, Acquire)
 
-                        return $ OP_Pair (OP_Pair word8False curIndex) (OP_Pair newReduction word8True)
 
-                      )
-                      (A.ifThenElse (loopVartp, A.eq singleType curFlag reductionFlag)
-                        (do -- flag is 1, Load reduction, and add it to loopVar before returning it                          
-                            reduction <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt curIndex) reductionidx
+                        A.ifThenElse (loopVartp, A.eq singleType curFlag prefixFlag)
+                          (do -- flag is 2, Load prefix, and add it to loopVar before returning it
+                            prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt curIndex) prefixidx
 
                             newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
                               (
                                 if envsDescending envs then
-                                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction reduction
+                                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction prefix
                                 else
-                                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) reduction curReduction
+                                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix curReduction
                               )
-                              (return reduction)
+                              (return prefix)
 
-                            newIndex <- indexMin1 curIndex
+                            tupleStore tp accumVar newReduction
+                            -- tupleStore tp prevReduction newReduction
+                            -- test <- tupleLoad (TupRsingle scalarTypeInt) prevIdx
+                            -- putInt test
 
-                            return $ OP_Pair (OP_Pair word8True newIndex) (OP_Pair newReduction word8True)
-                        )
-                        (do
-                          -- putcharStr "flag 0"
-                          return loopVar)
-                      )
-              )
-              ( OP_Pair (OP_Pair word8True prevIndex) maybeStart
-              )
-            let OP_Pair _ (OP_Pair prefix _) = result
-            -- Apply the prefix to our local reduction
-            ( if envsDescending envs then
-                    app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
-                  else
-                    app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
-                )
+                            return $ OP_Pair (OP_Pair word8False curIndex) (OP_Pair newReduction word8True)
 
-        tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx newPrefix
-        _ <- instr' $ Fence (CrossThread, Release)
-        tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
+                          )
+                          (A.ifThenElse (loopVartp, A.eq singleType curFlag reductionFlag)
+                            (do -- flag is 1, Load reduction, and add it to loopVar before returning it                          
+                                reduction <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt curIndex) reductionidx
 
+                                newReduction <- A.ifThenElse (tp, A.eq singleType hasValue word8True)
+                                  (
+                                    if envsDescending envs then
+                                      app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) curReduction reduction
+                                    else
+                                      app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) reduction curReduction
+                                  )
+                                  (return reduction)
+
+                                newIndex <- indexMin1 curIndex
+
+                                return $ OP_Pair (OP_Pair word8True newIndex) (OP_Pair newReduction word8True) -- ((flag, index) (accumReduction, (hasValue, isPrevBlock)))
+                            )
+                            (do
+                              -- putString "flag 0"
+                              return loopVar)
+                          )
+                  )
+                  ( OP_Pair (OP_Pair word8True prevIndex) maybeStart
+                  )
+                let OP_Pair _ (OP_Pair prefix _) = result
+                -- Apply the prefix to our local reduction
+                ( if envsDescending envs then
+                        app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
+                      else
+                        app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
+                    )
+
+            tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx newPrefix
+            _ <- instr' $ Fence (CrossThread, Release)
+            tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
+            return (boolean False) -- TODO: This should not be boolean True
+      _ -> internalError "threadMemory impossible"
   )
   (\_ _ _ -> return ())
   -- Code after the loop
@@ -797,33 +832,37 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (isNothing seed, \accumVar _ envs -> do
-      x <- readArray' envs input index
-      if isJust seed then do
-        accum <- tupleLoad tp accumVar
-        codePre envs accum
-        new <- if envsDescending envs then
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-        else
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        codePost envs new
-        tupleStore tp accumVar new
-      else do
-        isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
-        new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
-          ( do
-            return x
-          )
-          ( do
+    Just (isNothing seed, \threadMemPtr _ envs -> do
+      threadMem <- threadPtrToMem threadMemPtr
+      case threadMem of
+        TupRpair accumVar _ -> do
+          x <- readArray' envs input index
+          if isJust seed then do
             accum <- tupleLoad tp accumVar
             codePre envs accum
-            if envsDescending envs then
+            new <- if envsDescending envs then
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
             else
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-          )
-        codePost envs new
-        tupleStore tp accumVar new
+            codePost envs new
+            tupleStore tp accumVar new
+          else do
+            isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
+            new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
+              ( do
+                return x
+              )
+              ( do
+                accum <- tupleLoad tp accumVar
+                codePre envs accum
+                if envsDescending envs then
+                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
+                else
+                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+              )
+            codePost envs new
+            tupleStore tp accumVar new
+        TupRsingle _ -> internalError "Pair impossible"
     )
   )
   where
@@ -849,6 +888,20 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       = Just $ mkConstant tp v
       | otherwise
       = Nothing
+    halfArray :: PrimType (SizedArray (Struct e)) -- Don't understand why this needs to be struct
+    halfArray = ArrayPrimType 4 (StructPrimType False (mapTupR ScalarPrimType tp)) -- TODO: size should be dynamic based on tileSize / 2
+    threadTp :: PrimType (Struct (e, ((e, Int), (SizedArray  (Struct e), Word8))))
+    threadTp = StructPrimType False $ TupRpair (mapTupR ScalarPrimType tp) (TupRpair                                  -- Accumvar
+                                  (TupRpair (mapTupR ScalarPrimType tp) (TupRsingle (ScalarPrimType scalarTypeInt)))  -- PrevVar, PrevVarIndex
+                                  (TupRpair (TupRsingle halfArray) (TupRsingle (ScalarPrimType scalarTypeWord8))))    -- PrevArray, hasPrevTile
+    -- threadPtrToMem :: Operand (Ptr (Struct full)) -> CodeGen Native (TupR Operand (Distribute Ptr full))
+    -- threadPtrToMem p = case threadTp of
+    --   StructPrimType _ rep -> tuplePtrs' rep p
+    --   _ -> internalError "threadTp is not a struct"
+    threadPtrToMem threadMemPtr = case threadTp of
+      StructPrimType _ rep -> do
+        tuplePtrs' rep threadMemPtr -- Can I actually use tuplePtrs' here?
+      _ -> internalError "threadTp is not a struct"
     tileFlagidx = tupleLeft (tupleLeft TupleIdxSelf)
     reductionidx = tupleRight (tupleLeft TupleIdxSelf)
     prefixidx = tupleRight TupleIdxSelf
@@ -1037,7 +1090,7 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
         _ <- instr' $ Fence (CrossThread, Release)
         OP_Int nextIdx <- A.add numType (envsTileIndex envs) (A.liftInt 1)
         _ <- instr' $ Store Volatile idxPtr nextIdx
-        return ()
+        return (boolean True) -- Boolean is not used
   )
   (\_ _ _ -> return ())
   -- Code after the loop

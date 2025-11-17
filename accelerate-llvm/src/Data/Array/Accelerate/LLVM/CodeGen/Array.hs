@@ -21,7 +21,7 @@ module Data.Array.Accelerate.LLVM.CodeGen.Array (
   readBuffer,
   writeBuffer,
 
-  tupleAlloca, tuplePtrs, tuplePtrs', tupleStore, tupleStoreArray, tupleLoad, tupleLoadArray,
+  tupleAlloca, tupleAlloca', tuplePtrs, tuplePtrs', tupleStore, tupleStoreArray, tupleLoad, tupleLoadArray,
 
   intOfIndex,
 
@@ -272,6 +272,17 @@ tupleAlloca (TupRpair t1 t2) = TupRpair <$> tupleAlloca t1 <*> tupleAlloca t2
 tupleAlloca (TupRsingle tp)
   | Refl <- reprIsSingle @ScalarType @e @Ptr tp
   = TupRsingle <$> hoistAlloca (ScalarPrimType tp)
+
+-- | Alternative version of tupleAlloca that works for PrimType
+-- 
+
+tupleAlloca' :: forall full arch. TupR PrimType full -> CodeGen arch (TupR Operand (Distribute Ptr full))
+tupleAlloca' TupRunit = return TupRunit
+tupleAlloca' (TupRpair t1 t2)
+  = TupRpair <$> tupleAlloca' t1 <*> tupleAlloca' t2
+tupleAlloca' (TupRsingle t)
+  | Refl <- reprIsSingle @PrimType @full @Ptr t
+  = TupRsingle <$> hoistAlloca t
 
 tuplePtrs :: forall full arch. TypeR full -> Operand (Ptr (Struct full)) -> CodeGen arch (TupR Operand (Distribute Ptr full))
 tuplePtrs tp ptr = go TupleIdxSelf tp
