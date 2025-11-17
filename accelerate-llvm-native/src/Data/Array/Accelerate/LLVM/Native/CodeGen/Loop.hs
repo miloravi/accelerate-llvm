@@ -316,3 +316,11 @@ putString str = foldl (>>) (return ()) (map (void . putchar . liftInt . fromEnum
 
 unsafePrintInt :: Operands e -> CodeGen Native ()
 unsafePrintInt = putInt . unsafeCoerce
+
+putBool :: Operands Bool -> CodeGen Native ()
+putBool x = void $ A.ifThenElse' (TupRunit, x)
+                    (putString "True"  >> return OP_Unit)
+                    (putString "False" >> return OP_Unit)
+
+unsafePrintBool :: Operands e -> CodeGen Native ()
+unsafePrintBool = putBool . unsafeCoerce
