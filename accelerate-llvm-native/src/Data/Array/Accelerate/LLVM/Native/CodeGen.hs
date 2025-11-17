@@ -259,6 +259,7 @@ codegen name env cluster args
               -- Parallel mode
               (do
                 -- Hier de vorige environment opslaan
+
                 forM_ ((True, ptFirstLoop tileLoops) : map (False, ) (ptOtherLoops tileLoops)) $ \(isFirstTileLoop, tileLoop) -> do
                   -- All nested loops are placed in the first tile loop by parCodeGens
                   let loops'' = if isFirstTileLoop then loops' else []
@@ -615,20 +616,12 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
 
   -- Initialize a thread
   (\_ _ -> do
-    threadMemPtr <- hoistAlloca threadTp
-    threadMem <- threadPtrToMem threadMemPtr
-    case threadMem of
-      TupRpair _ (TupRpair _ (TupRpair _ hasPrevTile)) -> do
-        _ <- tupleStore (TupRsingle scalarTypeWord8) hasPrevTile word8False -- no previous tile yet
-        return ()
-      _ -> internalError "threadMemory impossible"
-    
-    return threadMemPtr
-    -- tupleAlloca (TupRpair (tp) (TupRpair (TupRsingle scalarTypeInt) (TupRsingle scalarTypeWord8)))
+    threadMem <- tupleAlloca threadMemTp    
+    -- Initialize thread memory here:
+    return threadMem
   )
   -- Code before the tile loop
-  (\singleThreaded threadMemPtr ptr envs -> do
-    threadMem <- threadPtrToMem threadMemPtr
+  (\singleThreaded threadMem ptr envs -> do
     case threadMem of
       TupRpair accumVar _ -> do
         if singleThreaded then do
@@ -654,8 +647,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
 
   )
   -- Code within the tile loop
-  (\singleThreaded threadMemPtr _ envs -> do
-    threadMem <- threadPtrToMem threadMemPtr
+  (\singleThreaded threadMem _ envs -> do
     case threadMem of
       TupRpair accumVar _ -> do
         if singleThreaded then do
@@ -714,8 +706,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       _ -> internalError "threadMemory impossible"
   )
   -- Code after the tile loop
-  (\singleThreaded threadMemPtr ptr envs -> do -- TODO: hierin true returnen als deze is afgerond, en false als die niet is afgerond?
-    threadMem <- threadPtrToMem threadMemPtr
+  (\singleThreaded threadMem ptr envs -> do -- TODO: hierin true returnen als deze is afgerond, en false als die niet is afgerond?
     case threadMem of
       TupRpair accumVar _ -> do
         ptrs <- tuplePtrs' memoryTp ptr
@@ -832,8 +823,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (isNothing seed, \threadMemPtr _ envs -> do
-      threadMem <- threadPtrToMem threadMemPtr
+    Just (isNothing seed, \threadMem _ envs -> do
       case threadMem of
         TupRpair accumVar _ -> do
           x <- readArray' envs input index
@@ -888,20 +878,10 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       = Just $ mkConstant tp v
       | otherwise
       = Nothing
-    halfArray :: PrimType (SizedArray (Struct e)) -- Don't understand why this needs to be struct
-    halfArray = ArrayPrimType 4 (StructPrimType False (mapTupR ScalarPrimType tp)) -- TODO: size should be dynamic based on tileSize / 2
-    threadTp :: PrimType (Struct (e, ((e, Int), (SizedArray  (Struct e), Word8))))
-    threadTp = StructPrimType False $ TupRpair (mapTupR ScalarPrimType tp) (TupRpair                                  -- Accumvar
-                                  (TupRpair (mapTupR ScalarPrimType tp) (TupRsingle (ScalarPrimType scalarTypeInt)))  -- PrevVar, PrevVarIndex
-                                  (TupRpair (TupRsingle halfArray) (TupRsingle (ScalarPrimType scalarTypeWord8))))    -- PrevArray, hasPrevTile
-    -- threadPtrToMem :: Operand (Ptr (Struct full)) -> CodeGen Native (TupR Operand (Distribute Ptr full))
-    -- threadPtrToMem p = case threadTp of
-    --   StructPrimType _ rep -> tuplePtrs' rep p
-    --   _ -> internalError "threadTp is not a struct"
-    threadPtrToMem threadMemPtr = case threadTp of
-      StructPrimType _ rep -> do
-        tuplePtrs' rep threadMemPtr -- Can I actually use tuplePtrs' here?
-      _ -> internalError "threadTp is not a struct"
+    threadMemTp :: TupR ScalarType (e, (Word8, Int))
+    threadMemTp = TupRpair 
+              tp                                                                    -- Accumvar
+                (TupRpair (TupRsingle scalarTypeWord8) (TupRsingle scalarTypeInt))  -- hasPrevTile, PrevVarIndex
     tileFlagidx = tupleLeft (tupleLeft TupleIdxSelf)
     reductionidx = tupleRight (tupleLeft TupleIdxSelf)
     prefixidx = tupleRight TupleIdxSelf
