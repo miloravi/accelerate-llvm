@@ -208,8 +208,9 @@ codegen name env cluster args
           envs''' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs''
           workassistLoop workassistIndex workassistFirstIndex tileCount $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
+      
 
-            tileIdxAbsolute <-
+            tileIdxAbsolute <- -- TODO: duplicate code
               -- For a scanr, convert low-to-high indices to high-to-low indices:
               -- The first block (with tileIdx 0) should now correspond with the last
               -- values of the array. We implement that by reversing the tile indices here.
@@ -310,22 +311,35 @@ codegen name env cluster args
                       genSequential envs''''' loops'' $ ptIn tileLoop -- The tile loop
 
                     -- Perform the previous lookback here IF prevHasFinished is false
-                    A.unless (return $ OP_Bool prevHasFinished) $ do
-                      prevIndexVal <- tupleLoad (TupRsingle scalarTypeInt) prevIndex
-                      -- TODO: duplicate code
-                      let prevEnv = envs''''{
-                          -- envsIsFirst = A.liftBool False,
-                          envsTileIndex = prevIndexVal
-                        }
-                      -- It needs to succeed this time, so set mustFinish to true
-                      _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool True)
-                      _ <- ptAfter tileLoop prevEnv -- disregard outcome, since it is always true
-                      return ()
+                    void $ A.ifThenElse' (TupRunit, OP_Bool prevHasFinished)
+                      (do
+                        lookbackFinished <- ptAfter tileLoop envs''''
+                        _ <- instr' $ Store NonVolatile hasFinished $ op BoolPrimType $ OP_Bool lookbackFinished
+                        return OP_Unit
+                      )
+                      (do
+                        prevIndexVal <- tupleLoad (TupRsingle scalarTypeInt) prevIndex
+                        -- TODO: duplicate code
+                        let prevEnv = envs''''{
+                            -- envsIsFirst = A.liftBool False,
+                            envsTileIndex = prevIndexVal
+                          }
+                        -- It needs to succeed this time, so set mustFinish to true
+                        _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool True) -- Move this to prevIndex set moment
+                        _ <- ptAfter tileLoop prevEnv -- disregard outcome, since it is always true
+                        
+                        _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)
+                        lookbackFinished <- ptAfter tileLoop envs''''
+                        _ <- instr' $ Store NonVolatile hasFinished $ op BoolPrimType $ OP_Bool lookbackFinished
 
-                    -- perform own lookback
-                    lookbackFinished <- ptAfter tileLoop envs''''
-                    _ <- instr' $ Store NonVolatile hasFinished $ op BoolPrimType $ OP_Bool lookbackFinished
-                    return ()
+                        _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool True) -- Needs to be set to true again so we actually perform our previous scan-phase
+
+                        putInt prevIndexVal
+                        putString ": prev (reduce) this : "
+                        putInt $ envsTileIndex envs''''
+                        putString "\n"
+                        return OP_Unit
+                      )
                   
                   -- TODO: maybe put this in where?
                   isNotFirstTileLoop <- A.lnot $ A.liftBool isFirstTileLoop
@@ -337,9 +351,37 @@ codegen name env cluster args
                         -- envsIsFirst = A.liftBool False,
                         envsTileIndex = prevIndexVal
                       }
+                    
+                    putInt prevIndexVal
+                    putString ": prev (scan) this : "
+                    putInt $ envsTileIndex envs''''
+                    putString "\n"
+
+                    -- Basically change lower and upper to be good and you are good
+                    prevTileIdxAbsolute <- -- TODO: duplicate code
+                      if isDescending direction then do
+                        i <- A.sub numType (OP_Int tileCount') prevIndexVal
+                        A.sub numType i (A.liftInt 1)
+                      else
+                        return prevIndexVal
+                    prevLower <- A.mul numType prevTileIdxAbsolute (A.liftInt tileSize)
+                    prevUpper' <- A.add numType prevLower (A.liftInt tileSize)
+                    prevUpper <- A.min singleType prevUpper' size
+                    
                     ptBefore tileLoop prevEnv -- The pre-tile loop
-                    Loop.loopWith ann (isDescending direction) lower upper $ \isFirst idx -> do
-                      localIdx <- A.sub numType idx lower
+                    Loop.loopWith ann (isDescending direction) prevLower prevUpper $ \isFirst idx -> do -- TODO: look here for what index it is
+                      localIdx <- A.sub numType idx prevLower
+                      putString "lower:  "
+                      putInt lower
+                      putString " | prevLower: "
+                      putInt prevLower
+                      putString " | upper: "
+                      putInt upper
+                      putString " | prevUpper: "
+                      putInt prevUpper
+                      putString " | localIdx: "
+                      putInt localIdx
+                      putString "\n"
                       let envs''''' = prevEnv{
                           envsLoopDepth = 1,
                           envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs''',
@@ -348,6 +390,10 @@ codegen name env cluster args
                         }
                       genSequential envs''''' loops'' $ ptIn tileLoop -- The tile loop
                     _ <- ptAfter tileLoop prevEnv
+
+                    -- set mustFinish to false now, since it has finished
+                    _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)
+
                     return ()
 
                   -- Perform other steps if lookback was succesfull, and if hasFinished is true
@@ -378,12 +424,15 @@ codegen name env cluster args
 
           -- TODO: optimize this loop
           A.unless (return $ OP_Bool prevHasFinished) $ do
+            -- set mustFinish to true?
+            _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool True)
             prevIndexVal <- tupleLoad (TupRsingle scalarTypeInt) prevIndex
             let envs'''' = envs'''{
                 envsTileIndex = prevIndexVal
               }
 
-          -- TODO: change these upper and lower to not fully calculate it again at this point for seemingly no reason :)
+
+            -- TODO: change these upper and lower to not fully calculate it again at this point for seemingly no reason :)
             tileIdxAbsolute <-
                 -- For a scanr, convert low-to-high indices to high-to-low indices:
                 -- The first block (with tileIdx 0) should now correspond with the last
@@ -529,8 +578,29 @@ parCodeGen descending mustFinish (FlatOp (NScan1 _)
   = Just $ parCodeGenScanLookback descending mustFinish IsScan fun Nothing input inputIdx
     (\_ _ -> return ())
     (\_ _ -> return ())
-    (\envs result -> writeArray' envs output outputIdx result)
+    (\envs result -> writeArray' envs output outputIdx result) -- make an if else on mustFinish, whether to use outputIdx, OR generate one ourselves using envsTileIndex
+    -- (\envs result -> do
+    --   isPrevious <- instr' $ LoadBool NonVolatile mustFinish    -- is false first tile
+    --   void $ A.ifThenElse' (TupRunit, OP_Bool isPrevious)
+    --     (do 
+    --       -- n'<- case envsTileIndex envs of
+    --       --   OP_Int prevTileIndex -> return prevTileIndex
+    --       -- A.add
+          
+    --       A.mul numType (envsTileIndex envs) ()
+    --       writeArrayAt' envs output rowIdx n' result
+    --       return OP_Unit
+    --     ) -- it is the previous
+    --     (do 
+    --       writeArray' envs output outputIdx result
+    --       return OP_Unit
+    --     ) -- normal behaviour
+    -- )
     (\_ _ -> return ())
+  where -- multiple rowIdx's
+    rowIdx = case inputIdx of
+        TupRpair i _ -> i
+        _ -> internalError "Shape impossible"
 parCodeGen descending mustFinish (FlatOp (NScan' _)
     (ArgFun fun :>: ArgExp seed :>: input :>: output :>: foldOutput :>: _)
     (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: IdxArgIdx _ foldOutputIdx :>: _))
@@ -763,7 +833,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   -- Code before the tile loop
   (\singleThreaded threadMem ptr envs -> do
     case threadMem of
-      TupRpair accumVar (TupRpair _ prevIndex) -> do
+      TupRpair accumVar _ -> do
         -- Initialize the prevIndex, TODO change this for 
         -- A.when (A.eq singleType (envsTileIndex envs) (A.liftInt 0)) $ do
         --   tupleStore (TupRsingle scalarTypeInt) prevIndex unavailableIdx
@@ -786,7 +856,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
             Just identity' -> do
               value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
               tupleStore tp accumVar value
-      _ -> internalError "threadMemory impossible"
+      TupRsingle _ -> internalError "threadMemory impossible from before the tileLoop"
 
   )
   -- Code within the tile loop
@@ -804,7 +874,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
             else
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-            codePost envs new
+            codePost envs new -- REMOVE: basically writes to the array
             tupleStore tp accumVar new
           else do
             isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
@@ -847,12 +917,12 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
                 )
 
           tupleStore tp accumVar new
-      _ -> internalError "threadMemory impossible"
+      TupRsingle _ -> internalError "threadMemory impossible from reduce phase"
   )
   -- Code after the tile loop
   (\singleThreaded threadMem ptr envs -> do -- TODO: hierin true returnen als deze is afgerond, en false als die niet is afgerond?
     case threadMem of
-      TupRpair accumVar (TupRpair _ _) -> do
+      TupRpair accumVar prevAccumVar -> do
         
         ptrs <- tuplePtrs' memoryTp ptr
         local <- tupleLoad tp accumVar
@@ -861,14 +931,13 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
           TupRsingle tileArray -> do
             -- Should only go once in singleThreaded mode regardless of mustFinish
             if singleThreaded then do
+                putInt (envsTileIndex envs)
+                putString ": storing prefix in singleThreaded\n"
+
                 tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx local
                 _ <- instr' $ Fence (CrossThread, Release)
                 tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
                 
-                putInt (envsTileIndex envs)
-                putString ": storing prefix in singleThreaded\n"
-                -- TODO: why only local here, not excl and incl?
-                tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local 
                 return $ boolean True
               else do
                 mustFinishVal <- instr' $ LoadBool NonVolatile mustFinish
@@ -884,7 +953,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
                   )
 
                 -- Store the local result in the tile array
-
+                -- TODO: for variant this should check should come in case 2 instead
                 A.when (return $ OP_Bool mustFinishVal) (do -- scalarTypeWord8 functions as a bool once again :)
                   -- Local can be different than tileLoop local, therefore we get it from kernel memory
                   prevLocal <- tupleLoadArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx
@@ -970,10 +1039,10 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
                   _ <- instr' $ Fence (CrossThread, Release)
                   tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
                   
+                  -- TODO: For variant, store in prevVar instead of accumVar iff mustFinish, i might already be in mustFinishVal here, so this check is unnecessary
                   putInt (envsTileIndex envs)
                   putString ": storing half-sized excl-prefix\n"
-                  tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx prefix
-
+                  tupleStore tp prevAccumVar prefix
 
                     -- writing this seems double, but will be needed for disambiguation of the variant later
                   -- _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)   
@@ -992,7 +1061,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
             --   tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
             
             -- return hasFinished
-      _ -> internalError "threadMemory impossible"
+      TupRsingle _ -> internalError "threadMemory impossible from ptAfter tileLoop"
   )
   (\_ _ _ -> return ())
   -- Code after the loop
@@ -1012,55 +1081,64 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (isNothing seed, \threadMem ptr envs -> do
-      ptrs <- tuplePtrs' memoryTp ptr
-      case ptrs of
-        TupRsingle tileArray -> do
-          case threadMem of
-            TupRpair accumVar _ -> do
-              -- First time, load accumVar from kernel memory
-              A.when (return $ envsIsFirst envs) (do
-                accum <- tupleLoadArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx
-                tupleStore tp accumVar accum
+    Just (isNothing seed, \threadMem _ envs -> do
+      case threadMem of
+        TupRpair accumVar prevAccumVar -> do
+          -- We use the prevAccumvar generally, but if no mustFinish, we can use the regular since no half-sized block in storage 
+          -- First time, load accumVar from kernel memory
+          A.when (return $ envsIsFirst envs) (do
+            mustFinishVal <- instr' $ LoadBool NonVolatile mustFinish
 
-                -- REMOVE: Debug prints
-                putInt (envsTileIndex envs)
-                putString ": loading accum in second TileLoop: "
-                unsafePrintInt accum
-                putString "\n"
+            A.unless (return $ OP_Bool mustFinishVal) $ do
+              excl_prefix <- tupleLoad tp accumVar
+              tupleStore tp prevAccumVar excl_prefix
+              putString "ZEHAHAHHAHHAAHA"
 
-                )
+              -- REMOVE: Debug prints
+            print_prefix <- tupleLoad tp prevAccumVar
+            putInt (envsTileIndex envs)
+            putString ": loading accum in second TileLoop: "
+            unsafePrintInt print_prefix
+            putString "\n"
+            )
 
-              putInt (envsTileIndex envs)
-              putString ": Iterating through second TileLoop"
+          -- A.when (A.eq singleType (envsTileIndex envs) (A.liftInt 1)) $ do
+          putInt $ envsTileLocalIndex envs
+          putString ": tile "
+          putInt $ envsTileIndex envs 
+          putString " in this subTile\n"
 
-              x <- readArray' envs input index
-              if isJust seed then do
-                accum <- tupleLoad tp accumVar
+          -- putInt $ OP_Int index
+          -- putString " : this index"
+
+
+          x <- readArray' envs input index
+          if isJust seed then do
+            accum <- tupleLoad tp prevAccumVar
+            codePre envs accum
+            new <- if envsDescending envs then
+              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
+            else
+              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+            codePost envs new
+            tupleStore tp prevAccumVar new
+          else do
+            isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
+            new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
+              ( do
+                return x
+              )
+              ( do
+                accum <- tupleLoad tp prevAccumVar
                 codePre envs accum
-                new <- if envsDescending envs then
+                if envsDescending envs then
                   app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
                 else
                   app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-                codePost envs new
-                tupleStore tp accumVar new
-              else do
-                isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
-                new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
-                  ( do
-                    return x
-                  )
-                  ( do
-                    accum <- tupleLoad tp accumVar
-                    codePre envs accum
-                    if envsDescending envs then
-                      app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-                    else
-                      app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-                  )
-                codePost envs new
-                tupleStore tp accumVar new
-            _ -> internalError "threadMemory impossible"
+              )
+            codePost envs new
+            tupleStore tp prevAccumVar new
+        TupRsingle _ -> internalError "threadMemory impossible from scan phase"
     )
   )
   where
@@ -1086,12 +1164,8 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
       = Just $ mkConstant tp v
       | otherwise
       = Nothing
-    threadMemTp :: TupR ScalarType (e, (Word8, Int))
-    threadMemTp = TupRpair 
-                tp                                                                    -- Accumvar
-                (TupRpair (TupRsingle scalarTypeWord8) (TupRsingle scalarTypeInt))  -- performWork?, PrevIndex
-    -- threadMemTp :: TupR ScalarType (e, Int)
-    -- threadMemTp = TupRpair tp (TupRsingle scalarTypeInt)  -- accumVar, prevIndex
+    threadMemTp :: TupR ScalarType (e, e)
+    threadMemTp = TupRpair tp tp -- Accumvar, prevAccumVar
     tileFlagidx = tupleLeft (tupleLeft TupleIdxSelf)
     reductionidx = tupleRight (tupleLeft TupleIdxSelf)
     prefixidx = tupleRight TupleIdxSelf
