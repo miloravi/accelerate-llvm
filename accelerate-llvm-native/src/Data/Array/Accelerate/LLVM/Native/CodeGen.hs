@@ -77,6 +77,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.Loop (imapFromStepTo)
 import LLVM.AST.Type.Operand (Operand)
 
 -- Temporary imports for debugging
+import Foreign.C.Types (CInt(..))
 
 
 codegen :: String
@@ -113,9 +114,7 @@ codegen name env cluster args
       -- Booleans used to interleave half-sized tiles
       mustFinish <- hoistAlloca BoolPrimType
       hasFinished <- hoistAlloca BoolPrimType
-      _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)
-      _ <- instr' $ Store NonVolatile hasFinished $ op BoolPrimType (A.liftBool True)
-
+      
       -- Parallelise over first dimension using parallel folds or scans
       case parCodeGens (parCodeGen (isDescending direction) mustFinish) 0 $ opCodeGens opCodeGen flatOps of
         Nothing -> internalError "Could not generate code for a cluster. Does parCodeGen lack a case for a collective parallel operation?"
@@ -205,10 +204,14 @@ codegen name env cluster args
           -- TODO: We can make this more precise by tracking whether arrays are
           -- only used in one tile loop. These arrays can also be stored as a
           -- single value.
+
+          -- Reset these values whenever you re-enter the workAssisting loop
+          _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)
+          _ <- instr' $ Store NonVolatile hasFinished $ op BoolPrimType (A.liftBool True)
+
           envs''' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs''
           workassistLoop workassistIndex workassistFirstIndex tileCount $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
-      
 
             tileIdxAbsolute <- -- TODO: duplicate code
               -- For a scanr, convert low-to-high indices to high-to-low indices:
@@ -297,6 +300,7 @@ codegen name env cluster args
                   
                   prevMustFinish <- instr' $ LoadBool NonVolatile mustFinish    -- is false first tile
                   prevHasFinished <- instr' $ LoadBool NonVolatile hasFinished  -- is true first tile
+                  putString "; Tile loop begin.\n"
 
                   A.when (return $ A.liftBool isFirstTileLoop) $ do
                     ptBefore tileLoop envs'''' -- The pre-tile loop
@@ -417,13 +421,42 @@ codegen name env cluster args
                       return ()                  
                 return OP_Unit
               )
+
+            -- For testing purposes, we stall the finish-up of the first thread, If the work assist index is equal to workassistFirstIndex, wait for 1 second
+            -- wAssIndex <- instr' $ BitCast scalarTypeWord64 workassistIndex
+            -- prevIndexVal <- tupleLoad (TupRsingle scalarTypeInt) prevIndex
+            -- wAssIndex <- tupleLoad (TupRsingle scalarTypeWord64) (TupRsingle workassistIndex) -- This could
+            -- wAssFirstIndex <- tupleLoad (TupRsingle scalarTypeWord64) (TupRsingle workassistFirstIndex)
+
+            _ <- A.ifThenElse (TupRsingle scalarTypeWord64, A.eq singleType (A.liftWord64 0) (OP_Word64 workassistFirstIndex))
+              (do
+                putString "First thread waiting for 1 million iterations\n"
+                ba <- Loop.while [] (TupRsingle scalarTypeWord64)
+                  (\counter -> do
+                    -- Count down from some value
+                    A.neq singleType counter (A.liftWord64 0)
+                  )
+                  (\(OP_Word64 counter) -> do
+                    new <- A.sub numType (OP_Word64 counter) (A.liftWord64 1)
+                    return new
+                  )
+                  (A.liftWord64 1000000)
+                putString "Finished waiting in first thread\n"
+                return ba
+                
+              )
+              (return $ A.liftWord64 0)
+
             return ()
+            
           
           -- perform final loop of the function
           prevHasFinished <- instr' $ LoadBool NonVolatile hasFinished  -- is true first tile
 
           -- TODO: optimize this loop
           A.unless (return $ OP_Bool prevHasFinished) $ do
+            putString "Final loop entered\n"
+
             -- set mustFinish to true?
             _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool True)
             prevIndexVal <- tupleLoad (TupRsingle scalarTypeInt) prevIndex
@@ -471,6 +504,8 @@ codegen name env cluster args
                     -- We can use LoopNonEmpty since we
                     -- know that each tile is non-empty.
                     ++ [ Loop.LoopNonEmpty ]
+              putString "; Final tile loop begin.\n"
+
               A.when (return $ A.liftBool isFirstTileLoop) $ do
                 _ <- ptAfter tileLoop envs''''
                 return ()
@@ -810,6 +845,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   memoryTp -- MemoryTp is now already primType 
   -- Initialize kernel memory, use only the first value for now
   (\ptr envs -> do
+    putString "{ Init kernel memory\n"
     ptrs <- tuplePtrs' memoryTp ptr
     case ptrs of
       TupRsingle tileArray -> do
@@ -832,11 +868,10 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   )
   -- Code before the tile loop
   (\singleThreaded threadMem ptr envs -> do
+    putString "> Pre tile loop\n"
     case threadMem of
       TupRpair accumVar _ -> do
         -- Initialize the prevIndex, TODO change this for 
-        -- A.when (A.eq singleType (envsTileIndex envs) (A.liftInt 0)) $ do
-        --   tupleStore (TupRsingle scalarTypeInt) prevIndex unavailableIdx
         if singleThreaded then do
           -- In the single threaded mode, we directly do a scan over this tile,
           -- instead of the reduce, lookback and scan phases.
@@ -861,6 +896,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   )
   -- Code within the tile loop
   (\singleThreaded threadMem _ envs -> do
+    putString "< In tile loop\n"
     case threadMem of
       TupRpair accumVar _ -> do
 
@@ -921,6 +957,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   )
   -- Code after the tile loop
   (\singleThreaded threadMem ptr envs -> do -- TODO: hierin true returnen als deze is afgerond, en false als die niet is afgerond?
+    putString "? Post tile loop (lookback)\n"
     case threadMem of
       TupRpair accumVar prevAccumVar -> do
         
@@ -1067,6 +1104,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   -- Code after the loop
   (\ptr envs -> do
     -- hier gebeurt ook iets wackys
+    putString "> actual codePost\n"
     ptrs <- tuplePtrs' memoryTp ptr
     case ptrs of
       TupRsingle tileArray -> do
@@ -1082,6 +1120,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
     Just (isNothing seed, \threadMem _ envs -> do
+      putString "# In tile loop (scan phase)\n"
       case threadMem of
         TupRpair accumVar prevAccumVar -> do
           -- We use the prevAccumvar generally, but if no mustFinish, we can use the regular since no half-sized block in storage 
@@ -1092,7 +1131,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
             A.unless (return $ OP_Bool mustFinishVal) $ do
               excl_prefix <- tupleLoad tp accumVar
               tupleStore tp prevAccumVar excl_prefix
-              putString "ZEHAHAHHAHHAAHA"
+              putString "Should only happen when running variant of half-sized tiles\n"
 
               -- REMOVE: Debug prints
             print_prefix <- tupleLoad tp prevAccumVar
@@ -1103,10 +1142,15 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
             )
 
           -- A.when (A.eq singleType (envsTileIndex envs) (A.liftInt 1)) $ do
-          putInt $ envsTileLocalIndex envs
-          putString ": tile "
+          putString "Tile "
           putInt $ envsTileIndex envs 
-          putString " in this subTile\n"
+          putString " performing scan phase in subTile "
+          putInt $ envsTileLocalIndex envs
+          prevAccum <- tupleLoad tp prevAccumVar
+          putString " with this value: "
+          unsafePrintInt prevAccum
+          putString "\n"
+          
 
           -- putInt $ OP_Int index
           -- putString " : this index"
@@ -1164,8 +1208,8 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
       = Just $ mkConstant tp v
       | otherwise
       = Nothing
-    threadMemTp :: TupR ScalarType (e, e)
-    threadMemTp = TupRpair tp tp -- Accumvar, prevAccumVar
+    threadMemTp :: TupR ScalarType (e, e) -- Accumvar, prevAccumVar
+    threadMemTp = TupRpair tp tp
     tileFlagidx = tupleLeft (tupleLeft TupleIdxSelf)
     reductionidx = tupleRight (tupleLeft TupleIdxSelf)
     prefixidx = tupleRight TupleIdxSelf
