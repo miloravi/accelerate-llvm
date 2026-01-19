@@ -76,10 +76,6 @@ import Data.Array.Accelerate.LLVM.CodeGen.Loop (imapFromStepTo)
 -- Imports for half-sized
 import LLVM.AST.Type.Operand (Operand)
 
--- Temporary imports for debugging
-import Foreign.C.Types (CInt(..))
-
-
 codegen :: String
         -> Env AccessGroundR env
         -> Clustered NativeOp args
@@ -128,7 +124,8 @@ codegen name env cluster args
                   -- first tile loop (the reduce step of the chained scan) are
                   -- still in the cache during the second tile loop (the scan
                   -- step of the chained scan).
-                  4 -- only for debugging
+                  1024 * 2
+                  -- 4 -- only for debugging
                 else
                   1024 * 16 -- TODO: Implement a better heuristic to choose the tile size
 
@@ -785,7 +782,6 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
   memoryTp -- MemoryTp is now already primType 
   -- Initialize kernel memory, use only the first value for now
   (\ptr envs -> do
-    putString "{ Init kernel memory\n"
     ptrs <- tuplePtrs' memoryTp ptr
     case ptrs of
       TupRsingle tileArray -> do
