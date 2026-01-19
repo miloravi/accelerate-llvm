@@ -212,6 +212,10 @@ codegen name env cluster args
           envs''' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs''
           workassistLoop workassistIndex workassistFirstIndex tileCount $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
+            putString "Entering workassist loop for tileIdx: "
+            putInt $ OP_Int tileIdx
+            putString "\n"
+            
 
             tileIdxAbsolute <- -- TODO: duplicate code
               -- For a scanr, convert low-to-high indices to high-to-low indices:
@@ -232,9 +236,16 @@ codegen name env cluster args
             -- the default mode already is as fast as a single-threaded mode.
             let seqMode' = if null (ptOtherLoops tileLoops) then boolean False else seqMode
 
+            -- CHANGE THIS BACK TODO: seqMode should not be this way forced
+            -- set seqMode to True if tileIdx is 0, otherwise set it to false (for testing)
+            -- seqModes' <- A.eq singleType (OP_Int tileIdx) (A.liftInt 0)
+            -- let OP_Bool seqMode' = seqModes'
+
             let envs'''' = envs'''{
                 envsTileIndex = OP_Int tileIdx
               }
+
+          
 
             -- Note: ifThenElse' does not generate code for the then-branch if
             -- the condition is a constant. Thus, if a kernel does not have a
@@ -314,6 +325,7 @@ codegen name env cluster args
                         }
                       genSequential envs''''' loops'' $ ptIn tileLoop -- The tile loop
 
+                    -- Currently not truly interleaving, since the reduction only shares at the start of the next phase? This couldbe solved by storing the reduction in this phase
                     -- Perform the previous lookback here IF prevHasFinished is false
                     void $ A.ifThenElse' (TupRunit, OP_Bool prevHasFinished)
                       (do
@@ -395,12 +407,9 @@ codegen name env cluster args
                       genSequential envs''''' loops'' $ ptIn tileLoop -- The tile loop
                     _ <- ptAfter tileLoop prevEnv
 
-                    -- set mustFinish to false now, since it has finished
-                    _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)
-
                     return ()
 
-                  -- Perform other steps if lookback was succesfull, and if hasFinished is true
+                  -- Perform other steps if lookback was successful, and if hasFinished is true
                   A.when (return isNotFirstTileLoop) $ do
                     -- obviously should be an ifthenelse instead
                     A.when (return $ OP_Bool prevHasFinished) $ do
@@ -416,36 +425,17 @@ codegen name env cluster args
                         genSequential envs''''' loops'' $ ptIn tileLoop -- The tile loop
                       _ <- ptAfter tileLoop envs''''
                       return ()
-                    A.unless (return $ OP_Bool prevHasFinished) $ do
-                      tupleStore (TupRsingle scalarTypeInt) prevIndex (OP_Int tileIdx)
-                      return ()                  
+  
+                -- LAST HERE IN TL2, go one more iteration
+                -- set mustFinish to false now, since it has finished
+                
+                prevHasFinished <- instr' $ LoadBool NonVolatile hasFinished  -- is true first tile
+                A.unless (return $ OP_Bool prevHasFinished) $ do -- THE PREV INDEX SHOULD ONLY CHANGE AFTER THE TILE LOOP? YES THIS IS CORRECT
+                  tupleStore (TupRsingle scalarTypeInt) prevIndex (OP_Int tileIdx)
+                  return ()
+                _ <- instr' $ Store NonVolatile mustFinish $ op BoolPrimType (A.liftBool False)               
                 return OP_Unit
               )
-
-            -- For testing purposes, we stall the finish-up of the first thread, If the work assist index is equal to workassistFirstIndex, wait for 1 second
-            -- wAssIndex <- instr' $ BitCast scalarTypeWord64 workassistIndex
-            -- prevIndexVal <- tupleLoad (TupRsingle scalarTypeInt) prevIndex
-            -- wAssIndex <- tupleLoad (TupRsingle scalarTypeWord64) (TupRsingle workassistIndex) -- This could
-            -- wAssFirstIndex <- tupleLoad (TupRsingle scalarTypeWord64) (TupRsingle workassistFirstIndex)
-
-            _ <- A.ifThenElse (TupRsingle scalarTypeWord64, A.eq singleType (A.liftWord64 0) (OP_Word64 workassistFirstIndex))
-              (do
-                putString "First thread waiting for 1 million iterations\n"
-                ba <- Loop.while [] (TupRsingle scalarTypeWord64)
-                  (\counter -> do
-                    -- Count down from some value
-                    A.neq singleType counter (A.liftWord64 0)
-                  )
-                  (\(OP_Word64 counter) -> do
-                    new <- A.sub numType (OP_Word64 counter) (A.liftWord64 1)
-                    return new
-                  )
-                  (A.liftWord64 1000000)
-                putString "Finished waiting in first thread\n"
-                return ba
-                
-              )
-              (return $ A.liftWord64 0)
 
             return ()
             
@@ -881,21 +871,21 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
               prevIndex <- indexMin1 (envsTileIndex envs)
               safePrevIndex <- A.max singleType (A.liftInt 0) prevIndex --TODO: waarom is hier safePrevIndex nodig?
               prefix <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt safePrevIndex) prefixidx
-
               tupleStore tp accumVar prefix
             --   -- Note: on the first tile, we read an undefined value if there is no
             --   -- seed. This is fine, as we don't use this value in the tile loop.
-        else
+        else do
           case identity of
             Nothing -> return ()
             Just identity' -> do
               value <- llvmOfExp (compileArrayInstrEnvs envs) identity'
               tupleStore tp accumVar value
+          -- Should we be doing the prevAccumvar check here?
       TupRsingle _ -> internalError "threadMemory impossible from before the tileLoop"
 
   )
   -- Code within the tile loop
-  (\singleThreaded threadMem _ envs -> do
+  (\singleThreaded threadMem ptr envs -> do
     putString "< In tile loop\n"
     case threadMem of
       TupRpair accumVar _ -> do
@@ -953,6 +943,19 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
                 )
 
           tupleStore tp accumVar new
+          -- Perform this only the first time you enter this, meaning only when mustFinishVal is false (TODO: Make this an if then else)
+          
+          putInt (envsTileIndex envs)
+          putString ": storing reduction: "
+          unsafePrintInt new
+          putString "\n"
+          
+          ptrs <- tuplePtrs' memoryTp ptr
+          
+          case ptrs of
+            TupRsingle tileArray -> do
+              tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx new
+
       TupRsingle _ -> internalError "threadMemory impossible from reduce phase"
   )
   -- Code after the tile loop
@@ -979,20 +982,16 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
               else do
                 mustFinishVal <- instr' $ LoadBool NonVolatile mustFinish
 
-                -- Perform this only the first time you enter this, meaning only when mustFinishVal is false (TODO: check if this makes sense)
-                A.unless (return $ OP_Bool mustFinishVal) (do
-                  putInt (envsTileIndex envs)
-                  putString ": storing prefix\n"
-                  
-                  tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local
-                  _ <- instr' $ Fence (CrossThread, Release)
-                  tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
-                  )
+                -- Release the reduction of this tile, since tileLoop has finished (is currently released twice, but shouldn't affect behaviour)
+                _ <- instr' $ Fence (CrossThread, Release)
+                tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
+
 
                 -- Store the local result in the tile array
                 -- TODO: for variant this should check should come in case 2 instead
                 A.when (return $ OP_Bool mustFinishVal) (do -- scalarTypeWord8 functions as a bool once again :)
                   -- Local can be different than tileLoop local, therefore we get it from kernel memory
+                  
                   prevLocal <- tupleLoadArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx
 
                   prevIndex <- indexMin1 (envsTileIndex envs)
@@ -1072,13 +1071,20 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
                           app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix prevLocal
                     )
                   
+                  putInt (envsTileIndex envs)
+                  putString ": storing incl-prefix: "
+                  unsafePrintInt incl_prefix
+                  putString "\n"
+
                   tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx incl_prefix
                   _ <- instr' $ Fence (CrossThread, Release)
                   tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
                   
                   -- TODO: For variant, store in prevVar instead of accumVar iff mustFinish, i might already be in mustFinishVal here, so this check is unnecessary
                   putInt (envsTileIndex envs)
-                  putString ": storing half-sized excl-prefix\n"
+                  putString ": storing half-sized excl-prefix: "
+                  unsafePrintInt prefix
+                  putString "\n"
                   tupleStore tp prevAccumVar prefix
 
                     -- writing this seems double, but will be needed for disambiguation of the variant later
