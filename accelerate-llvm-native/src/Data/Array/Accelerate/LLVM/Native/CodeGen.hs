@@ -274,6 +274,9 @@ codegen name env cluster args
                         -- We can use LoopNonEmpty since we
                         -- know that each tile is non-empty.
                         ++ [ Loop.LoopNonEmpty ]
+                  
+                  -- _ <- putInt $ envsTileIndex envs'''' 
+                  -- putString ": From parallel tile loop\n"
 
                   ptBefore tileLoop envs''''
                   Loop.loopWith ann (isDescending direction) lower upper $ \isFirst idx -> do
@@ -601,10 +604,21 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
             )
           case seed of
             Nothing -> return ()
+            -- Nothing -> do
+            --   -- 
+            --   A.when (A.eq singleType (OP_Int tileCount) (A.liftInt 0))
+            --     ( do
+            --       return ()
+            --     )
+            --   -- if tileCount == 0 then return () 
+            --   -- else return ()
             Just s -> do
               value <- llvmOfExp (compileArrayInstrEnvs envs) s
               codeSeed envs value
-              tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx value  )
+              tupleStoreArray tp NonVolatile tileArray (scalar scalarTypeInt 0) prefixidx value)
+              -- tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx value  )
+              -- _ <- instr' $ Fence (CrossThread, Release)
+              -- return ()
 
   -- Initialize a thread
   (\_ _ -> tupleAlloca tp)
@@ -779,6 +793,9 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
         _ <- instr' $ Fence (CrossThread, Release)
         tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
 
+        -- _ <- putInt $ envsTileIndex envs 
+        -- putString ": From ptAfter\n"
+
   )
   (\_ _ _ -> return ())
   -- Code after the loop
@@ -786,9 +803,10 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
     ptrs <- tuplePtrs' memoryTp ptr
     case ptrs of
       TupRsingle tileArray -> do
-        lastIndex <- indexMin1 $ OP_Int (envsTileCount envs)
+        prevIndex <- indexMin1 $ OP_Int (envsTileCount envs)
+        safePrevIndex <- A.max singleType (A.liftInt 0) prevIndex
 
-        value <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt lastIndex) prefixidx
+        value <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt safePrevIndex) prefixidx
 
         codeEnd envs value
   )
@@ -798,6 +816,9 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
     Just (isNothing seed, \accumVar _ envs -> do
+      -- A.when (return $ envsIsFirst envs) $ do 
+      --   -- _ <- putInt $ envsTileIndex envs 
+      --   -- putString ": From secondLoop\n"
       x <- readArray' envs input index
       if isJust seed then do
         accum <- tupleLoad tp accumVar
