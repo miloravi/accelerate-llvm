@@ -848,20 +848,22 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
     )
   )
   where
-    memoryTp = TupRsingle tileArray
+    
     -- tileArray = 
     ArgArray _ (ArrayR _ tp) _ _ = input
 
     -- flag + reduction + prefix 
     -- Having the type ruins it?
-
+    memoryTp = TupRsingle tileArray
     tileTP :: PrimType (Struct ((Word8, e), e))
-    tileTP = StructPrimType False $
+    tileTP = StructPrimType False $ 
       TupRsingle (ScalarPrimType scalarTypeWord8) `TupRpair`
       mapTupR ScalarPrimType tp `TupRpair`
       mapTupR ScalarPrimType tp
     tileArray :: PrimType (SizedArray  (Struct ((Word8, e), e)))
-    tileArray = ArrayPrimType arraySize tileTP -- No clue how many tiles I need, should look into this, prob make this a variable so I can have minimum for this and tilecount in filling of array
+    tileArray = ArrayPrimType arraySize tileTP
+    arraySize :: Word64 -- Constant array size, is this actually constant?
+    arraySize = 32768
     identity
       | Just s <- seed
       , if descending then isRightIdentity fun s else isLeftIdentity fun s
@@ -877,8 +879,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
       OP_Int idx -> idx
     indexMin1 idx = A.sub numType idx (A.liftInt 1)
     opsToOpInt (OP_Int i) = i
-    arraySize :: Word64 -- Temporary array size, should be circular eventually
-    arraySize = 32768
+
     unfinishedFlag :: Operands Word8
     unfinishedFlag = A.liftWord8 0
     reductionFlag :: Operands Word8
