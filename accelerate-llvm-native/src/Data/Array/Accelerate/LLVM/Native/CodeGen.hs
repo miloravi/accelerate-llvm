@@ -243,7 +243,7 @@ codegen name env cluster args
                   localIdx <- A.sub numType idx lower
                   let envs''''' = envs''''{
                       envsLoopDepth = 1,
-                      envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs''''',
+                      envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs'''',
                       envsIsFirst = isFirst,
                       envsTileLocalIndex = localIdx
                     }
@@ -863,7 +863,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
     tileArray :: PrimType (SizedArray  (Struct ((Word8, e), e)))
     tileArray = ArrayPrimType arraySize tileTP
     arraySize :: Word64 -- Constant array size, is this actually constant?
-    arraySize = 32768
+    arraySize = 32768 
     identity
       | Just s <- seed
       , if descending then isRightIdentity fun s else isLeftIdentity fun s
