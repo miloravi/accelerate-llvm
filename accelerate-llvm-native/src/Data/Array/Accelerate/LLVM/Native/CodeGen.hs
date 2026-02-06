@@ -265,7 +265,7 @@ codegen name env cluster args
                   localIdx <- A.sub numType idx lower
                   let envs''''' = envs''''{
                       envsLoopDepth = 1,
-                      envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs''''',
+                      envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs'''',
                       envsIsFirst = isFirst,
                       envsTileLocalIndex = localIdx
                     }
