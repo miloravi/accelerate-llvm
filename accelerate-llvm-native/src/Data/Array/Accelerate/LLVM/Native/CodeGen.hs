@@ -124,7 +124,7 @@ codegen name env cluster args
                   -- first tile loop (the reduce step of the chained scan) are
                   -- still in the cache during the second tile loop (the scan
                   -- step of the chained scan).
-                  1024 * 2
+                  1024 
                   -- 4 -- only for debugging
                 else
                   1024 * 16 -- TODO: Implement a better heuristic to choose the tile size
@@ -796,7 +796,7 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
             Just s -> do
               value <- llvmOfExp (compileArrayInstrEnvs envs) s
               codeSeed envs value
-              tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx value  )
+              tupleStoreArray tp NonVolatile tileArray (scalar scalarTypeInt 0) prefixidx value  )
 
   -- Initialize a thread
   (\_ _ -> do
@@ -908,8 +908,6 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
           TupRsingle tileArray -> do
             -- Should only go once in singleThreaded mode regardless of mustFinish
             if singleThreaded then do
-                putInt (envsTileIndex envs)
-
                 tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx local
                 _ <- instr' $ Fence (CrossThread, Release)
                 tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
@@ -1031,8 +1029,9 @@ parCodeGenScanLookback descending mustFinish foldOrScan fun seed input index cod
     case ptrs of
       TupRsingle tileArray -> do
         lastIndex <- indexMin1 $ OP_Int (envsTileCount envs)
+        safeLastIndex <- A.max singleType (A.liftInt 0) lastIndex
 
-        value <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt lastIndex) prefixidx
+        value <- tupleLoadArray tp NonVolatile tileArray (opsToOpInt safeLastIndex) prefixidx
 
         codeEnd envs value
   )
@@ -1283,6 +1282,28 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
             -- as this loop starts with the prefix value of the previous
             -- thread. We can directly write that to kernel memory.
             return local
+          else if isNothing seed then
+            -- If there is no seed, then write the output directly in the first tiles.
+            -- The other tiles must combine their result with the given operator.
+            -- Note that the first tile should typically be handled in the sequential mode,
+            -- but this sequential mode is not always generated:
+            -- A non-commutative fold is handled as a scan without the sequential mode.
+            -- Furthermore we could decide to skip the sequential mode if it leads to
+            -- a lot of code duplication (but we don't do that yet).s
+            A.ifThenElse (tp, A.eq singleType (envsTileIndex envs) (A.liftInt 0))
+              (do
+                return local
+              )
+              (do
+                prefix <- tupleLoad tp valuePtrs
+                tupleStore tp accumVar prefix
+                if envsDescending envs then
+                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
+                else
+                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
+              )
+          -- If there is a seed, then all tile will combine their local result with
+          -- the already available value.
           else do
             -- If there is no seed, then write the output directly in the first tiles.
             -- The other tiles must combine their result with the given operator.
