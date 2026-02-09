@@ -262,7 +262,7 @@ parCodeGens' g depth = \case
             (\_ _ -> return ())
             (\_ _ _ _ -> return ())
             (\_ _ _ _ -> return ())
-            (\_ _ _ _ -> return (boolean False)) -- Temporarily true, should not always be true
+            (\singleThreaded _ _ envs -> booleanHeuristic singleThreaded envs)
             (\_ _ _ -> return ())
             (\_ envs -> code envs)
             Nothing
@@ -275,7 +275,7 @@ parCodeGens' g depth = \case
             (\_ _ -> return ())
             (\_ _ _ _ -> return ())
             (\_ _ _ envs -> code envs)
-            (\_ _ _ _ -> return (boolean False)) -- Temporarily true, should not always be true
+            (\singleThreaded _ _ envs -> booleanHeuristic singleThreaded envs)
             (\_ _ _ -> return ())
             (\_ _ -> return ())
             Nothing
@@ -295,6 +295,13 @@ parCodeGens' g depth = \case
         Nothing -> Nothing
       | otherwise -> Just $ Exists $ ParGenDeeper depth' opCode next'
     Nothing -> Nothing
+  where
+    booleanHeuristic :: Bool -> Envs env idxEnv -> CodeGen target (Operand Bool)
+    booleanHeuristic singleThreaded envs
+      | singleThreaded = return $ boolean True
+      | otherwise = do 
+        OP_Bool testBool <-  A.eq singleType (envsTileIndex envs) (A.liftInt 0)
+        return testBool
 
 -- Hoists all ParGenDeeper to before the first ParGenTileLoopBoundary.
 -- Throws an error if this is not possible
