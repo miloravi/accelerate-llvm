@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP                   #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE GADTs                 #-}
 {-# LANGUAGE LambdaCase            #-}
@@ -27,7 +26,7 @@ import LLVM.AST.Type.Representation
 
 import Data.Array.Accelerate.Error
 
-import qualified Text.LLVM                                          as LLVM
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty     as LLVM
 
 import Data.Constraint
 import Data.Primitive.ByteArray
@@ -90,8 +89,8 @@ instance Downcast (Constant a) (LLVM.Typed LLVM.Value) where
 
       vector :: VectorType s -> s -> LLVM.Typed LLVM.Value
       vector (VectorType n s) (Vec ba#)
-        = LLVM.Typed (LLVM.Vector (fromIntegral n) (downcast s))
-        $ LLVM.ValVector (downcast s)
+        = LLVM.Typed (LLVM.Array (fromIntegral n) (downcast s))
+        $ LLVM.ValArray (downcast s)
         $ map (LLVM.typedValue . single s)
         $ singlePrim s `withDict` foldrByteArray (:) [] (ByteArray ba#)
 
@@ -132,8 +131,8 @@ instance Downcast (Constant a) (LLVM.Typed LLVM.Value) where
       floatingPrim TypeFloat  = Dict
       floatingPrim TypeDouble = Dict
 
-      inbounds :: Bool
-      inbounds = True
+      inbounds :: [LLVM.GEPAttr]
+      inbounds = [LLVM.GEP_Inbounds]
 
 instance TypeOf Constant where
   typeOf (BooleanConstant _)           = type'

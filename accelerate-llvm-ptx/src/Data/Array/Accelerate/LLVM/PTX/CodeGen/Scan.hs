@@ -5,6 +5,7 @@
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE TupleSections       #-}
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeOperators       #-}
 {-# LANGUAGE ViewPatterns        #-}
@@ -20,20 +21,22 @@
 
 module Data.Array.Accelerate.LLVM.PTX.CodeGen.Scan (
 
-  mkScan, mkScan',
+  scanWarp, scanFromSMem,
+  firstLane, lastLane
 
 ) where
 
 import Data.Array.Accelerate.AST                                    ( Direction(..) )
 import Data.Array.Accelerate.Representation.Array
-import Data.Array.Accelerate.Representation.Elt
 import Data.Array.Accelerate.Representation.Shape
 import Data.Array.Accelerate.Representation.Type
+import Data.Array.Accelerate.Error
 
 import Data.Array.Accelerate.LLVM.CodeGen.Arithmetic                as A
 import Data.Array.Accelerate.LLVM.CodeGen.Array
 import Data.Array.Accelerate.LLVM.CodeGen.Base
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
+import Data.Array.Accelerate.LLVM.CodeGen.Default
 import Data.Array.Accelerate.LLVM.CodeGen.Environment
 import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import Data.Array.Accelerate.LLVM.CodeGen.IR
@@ -43,22 +46,22 @@ import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.Compile.Cache
 import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Base
-import Data.Array.Accelerate.LLVM.PTX.CodeGen.Generate
 import Data.Array.Accelerate.LLVM.PTX.Target
 
+import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Representation
 
 import qualified Foreign.CUDA.Analysis                              as CUDA
 
 import Control.Applicative
 import Control.Monad                                                ( (>=>), void )
-import Control.Monad.State                                          ( gets )
+import Control.Monad.Reader                                         ( asks )
 import Data.String                                                  ( fromString )
 import Data.Coerce                                                  as Safe
 import Data.Bits                                                    as P
 import Prelude                                                      as P hiding ( last )
 
-
+{-
 
 -- 'Data.List.scanl' or 'Data.List.scanl1' style exclusive scan, but with the
 -- restriction that the combination function must be associative to enable
@@ -150,7 +153,7 @@ mkScanAllP1
     -> MIRDelayed PTX aenv (Vector e)           -- ^ input data
     -> CodeGen    PTX (IROpenAcc PTX aenv (Vector e))
 mkScanAllP1 dir uid aenv tp combine mseed marr = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrOut, paramOut)  = mutableArray (ArrayR dim1 tp) "out"
@@ -159,15 +162,7 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
       end                 = indexHead (irArrayShape arrTmp)
       paramEnv            = envParam aenv
       --
-      config              = launchConfig dev (CUDA.incWarp dev) smem const [|| const ||]
-      smem n
-        | canShfl dev     = warps * bytes
-        | otherwise       = warps * (1 + per_warp) * bytes
-        where
-          ws        = CUDA.warpSize dev
-          warps     = n `P.quot` ws
-          per_warp  = ws + ws `P.quot` 2
-          bytes     = bytesElt tp
+      config              = launchConfig dev (CUDA.incWarp dev) (scanSMemSize dev tp) const [|| const ||]
   --
   makeOpenAccWith config uid "scanP1" (paramTmp ++ paramOut ++ paramIn ++ paramEnv) $ do
 
@@ -187,7 +182,14 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
     s0  <- int bid
 
     -- iterating over thread-block-wide segments
+    -- Note that 'end' is a multiple of the gd', and the control flow is thus uniform in the loop.
+    -- This is set in scanAllOp in Data.Array.Accelerate.LLVM.PTX.Execute.
+    -- Hence we can run __syncthreads safely.
     imapFromStepTo s0 gd' end $ \chunk -> do
+
+      -- Make sure all threads have finished previous iterations,
+      -- so we can reuse (and overwrite) shared memory.
+      __syncthreads
 
       bd    <- blockDim
       bd'   <- int bd
@@ -271,7 +273,7 @@ mkScanAllP2
     -> IRFun2  PTX aenv (e -> e -> e)           -- ^ combination function
     -> CodeGen PTX      (IROpenAcc PTX aenv (Vector e))
 mkScanAllP2 dir uid aenv tp combine = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrTmp, paramTmp)  = mutableArray (ArrayR dim1 tp) "tmp"
@@ -279,17 +281,9 @@ mkScanAllP2 dir uid aenv tp combine = do
       start               = liftInt 0
       end                 = indexHead (irArrayShape arrTmp)
       --
-      config              = launchConfig dev (CUDA.incWarp dev) smem grid gridQ
+      config              = launchConfig dev (CUDA.incWarp dev) (scanSMemSize dev tp) grid gridQ
       grid _ _            = 1
       gridQ               = [|| \_ _ -> 1 ||]
-      smem n
-        | canShfl dev     = warps * bytes
-        | otherwise       = warps * (1 + per_warp) * bytes
-        where
-          ws        = CUDA.warpSize dev
-          warps     = n `P.quot` ws
-          per_warp  = ws + ws `P.quot` 2
-          bytes     = bytesElt tp
   --
   makeOpenAccWith config uid "scanP2" (paramTmp ++ paramEnv) $ do
 
@@ -320,11 +314,10 @@ mkScanAllP2 dir uid aenv tp combine = do
                       LeftToRight -> A.lt  singleType i end
                       RightToLeft -> A.gte singleType i start
 
+      -- wait for the carry-in value to be updated
+      __syncthreads
+
       when (valid i0) $ do
-
-        -- wait for the carry-in value to be updated
-        __syncthreads
-
         x0 <- readArray TypeInt arrTmp i0
         x1 <- if (tp, A.gt singleType offset (liftInt 0) `land'` A.eq singleType tid (liftInt32 0))
                 then do
@@ -368,7 +361,7 @@ mkScanAllP3
     -> MIRExp  PTX aenv e                       -- ^ seed element, if this is an exclusive scan
     -> CodeGen PTX      (IROpenAcc PTX aenv (Vector e))
 mkScanAllP3 dir uid aenv tp combine mseed = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrOut, paramOut)  = mutableArray (ArrayR dim1 tp) "out"
@@ -467,7 +460,7 @@ mkScan'AllP1
     -> MIRDelayed PTX aenv (Vector e)
     -> CodeGen    PTX      (IROpenAcc PTX aenv (Vector e, Scalar e))
 mkScan'AllP1 dir uid aenv tp combine seed marr = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrOut, paramOut)  = mutableArray (ArrayR dim1 tp) "out"
@@ -476,15 +469,7 @@ mkScan'AllP1 dir uid aenv tp combine seed marr = do
       end                 = indexHead (irArrayShape arrTmp)
       paramEnv            = envParam aenv
       --
-      config              = launchConfig dev (CUDA.incWarp dev) smem const [|| const ||]
-      smem n
-        | canShfl dev     = warps * bytes
-        | otherwise       = warps * (1 + per_warp) * bytes
-        where
-          ws        = CUDA.warpSize dev
-          warps     = n `P.quot` ws
-          per_warp  = ws + ws `P.quot` 2
-          bytes     = bytesElt tp
+      config              = launchConfig dev (CUDA.incWarp dev) (scanSMemSize dev tp) const [|| const ||]
   --
   makeOpenAccWith config uid "scanP1" (paramTmp ++ paramOut ++ paramIn ++ paramEnv) $ do
 
@@ -497,7 +482,14 @@ mkScan'AllP1 dir uid aenv tp combine seed marr = do
     gd  <- int =<< gridDim
 
     -- iterate over thread-block wide segments
+    -- Note that 'end' is a multiple of the gd', and the control flow is thus uniform in the loop.
+    -- This is set in scan'AllOp in Data.Array.Accelerate.LLVM.PTX.Execute.
+    -- Hence we can run __syncthreads safely.
     imapFromStepTo bid gd end $ \seg -> do
+
+      -- Make sure all threads have finished previous iterations,
+      -- so we can reuse (and overwrite) shared memory.
+      __syncthreads
 
       bd  <- int =<< blockDim
       inf <- A.mul numType seg bd
@@ -581,7 +573,7 @@ mkScan'AllP2
     -> IRFun2 PTX aenv (e -> e -> e)
     -> CodeGen PTX (IROpenAcc PTX aenv (Vector e, Scalar e))
 mkScan'AllP2 dir uid aenv tp combine = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrTmp, paramTmp)  = mutableArray (ArrayR dim1 tp) "tmp"
@@ -590,17 +582,9 @@ mkScan'AllP2 dir uid aenv tp combine = do
       start               = liftInt 0
       end                 = indexHead (irArrayShape arrTmp)
       --
-      config              = launchConfig dev (CUDA.incWarp dev) smem grid gridQ
+      config              = launchConfig dev (CUDA.incWarp dev) (scanSMemSize dev tp) grid gridQ
       grid _ _            = 1
       gridQ               = [|| \_ _ -> 1 ||]
-      smem n
-        | canShfl dev     = warps * bytes
-        | otherwise       = warps * (1 + per_warp) * bytes
-        where
-          ws        = CUDA.warpSize dev
-          warps     = n `P.quot` ws
-          per_warp  = ws + ws `P.quot` 2
-          bytes     = bytesElt tp
   --
   makeOpenAccWith config uid "scanP2" (paramTmp ++ paramSum ++ paramEnv) $ do
 
@@ -633,12 +617,7 @@ mkScan'AllP2 dir uid aenv tp combine = do
       x0 <- if (tp, valid i0)
               then readArray TypeInt arrTmp i0
               else
-                let go :: TypeR a -> Operands a
-                    go TupRunit       = OP_Unit
-                    go (TupRpair a b) = OP_Pair (go a) (go b)
-                    go (TupRsingle t) = ir t (undef t)
-                in
-                return $ go tp
+                return $ tupUndef tp
 
       x1 <- if (tp, A.gt singleType offset (liftInt 0) `A.land'` A.eq singleType tid (liftInt32 0))
               then do
@@ -691,7 +670,7 @@ mkScan'AllP3
     -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
     -> CodeGen PTX (IROpenAcc PTX aenv (Vector e, Scalar e))
 mkScan'AllP3 dir uid aenv tp combine = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrOut, paramOut)  = mutableArray (ArrayR dim1 tp) "out"
@@ -779,22 +758,14 @@ mkScanDim
     -> MIRDelayed PTX aenv (Array (sh, Int) e)      -- ^ input data
     -> CodeGen    PTX (IROpenAcc PTX aenv (Array (sh, Int) e))
 mkScanDim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine mseed marr = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrOut, paramOut)  = mutableArray repr "out"
       (arrIn,  paramIn)   = delayedArray "in" marr
       paramEnv            = envParam aenv
       --
-      config              = launchConfig dev (CUDA.incWarp dev) smem const [|| const ||]
-      smem n
-        | canShfl dev     = warps * bytes
-        | otherwise       = warps * (1 + per_warp) * bytes
-        where
-          ws        = CUDA.warpSize dev
-          warps     = n `P.quot` ws
-          per_warp  = ws + ws `P.quot` 2
-          bytes     = bytesElt tp
+      config              = launchConfig dev (CUDA.incWarp dev) (scanSMemSize dev tp) const [|| const ||]
   --
   makeOpenAccWith config uid "scan" (paramOut ++ paramIn ++ paramEnv) $ do
 
@@ -817,7 +788,17 @@ mkScanDim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine mseed marr = do
     gd  <- int =<< gridDim
     end <- shapeSize shr (indexTail (irArrayShape arrOut))
 
+    -- Iterate over the outer dimensions (all but the innermost dimension).
+    -- Within this loop we perform a scan over a row (innermost dimension) of
+    -- the input.
+    --
+    -- Since 'bid', 'gd' and 'end' are uniform, the control flow within this
+    -- loop is also uniform. We can thus perform __syncthreads in the loop.
     imapFromStepTo bid gd end $ \seg -> do
+
+      -- Make sure all threads have finished previous iterations,
+      -- so we can reuse (and overwrite) shared memory.
+      __syncthreads
 
       -- Index this thread reads from
       tid   <- threadIdx
@@ -877,12 +858,19 @@ mkScanDim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine mseed marr = do
             return $ A.trip sz i0 j1
 
           Nothing -> do
+            -- We cannot call scanBlock under non-uniform control flow.
+            -- Instead, we conditionally read the input, and then
+            -- unconditionally call scanBlock.
+            x0 <- if (tp, A.lt singleType tid' sz)
+                   then app1 (delayedLinearIndex arrIn) i0
+                   else return $ tupUndef tp
+            n' <- i32 sz
+
+            r0 <- if (tp, A.gte singleType sz bd')
+                    then scanBlock dir dev tp combine Nothing   x0
+                    else scanBlock dir dev tp combine (Just n') x0
+
             when (A.lt singleType tid' sz) $ do
-              n' <- i32 sz
-              x0 <- app1 (delayedLinearIndex arrIn) i0
-              r0 <- if (tp, A.gte singleType sz bd')
-                      then scanBlock dir dev tp combine Nothing   x0
-                      else scanBlock dir dev tp combine (Just n') x0
               writeArray TypeInt arrOut j0 r0
 
               ll <- A.sub numType bd (liftInt32 1)
@@ -895,6 +883,11 @@ mkScanDim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine mseed marr = do
             return $ A.trip n1 i1 j1
 
       -- Iterate over the remaining elements in this segment
+      -- The loop condition uses the first triple of the state, 'n'.
+      -- This variable is uniform (the same for all threads in the thread
+      -- block), since it is initialized as 'sz' or 'sz - bd', and lowered by
+      -- 'bd' each iteration. Hence the control flow in this loop is uniform,
+      -- and we can thus call __syncthreads within the loop.
       void $ while
         (TupRunit `TupRpair` TupRsingle scalarTypeInt `TupRpair` TupRsingle scalarTypeInt `TupRpair` TupRsingle scalarTypeInt)
         (\(A.fst3   -> n)       -> A.gt singleType n (liftInt 0))
@@ -912,13 +905,7 @@ mkScanDim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine mseed marr = do
           --
           x <- if (tp, A.lt singleType tid' n)
                  then app1 (delayedLinearIndex arrIn) i
-                 else let
-                          go :: TypeR a -> Operands a
-                          go TupRunit       = OP_Unit
-                          go (TupRpair a b) = OP_Pair (go a) (go b)
-                          go (TupRsingle t) = ir t (undef t)
-                      in
-                      return $ go tp
+                 else return $ tupUndef tp
 
           -- Thread zero incorporates the carry-in element
           y <- if (tp, A.eq singleType tid (liftInt32 0))
@@ -979,7 +966,7 @@ mkScan'Dim
     -> MIRDelayed PTX aenv (Array (sh, Int) e)      -- ^ input data
     -> CodeGen    PTX      (IROpenAcc PTX aenv (Array (sh, Int) e, Array sh e))
 mkScan'Dim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine seed marr = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   --
   let
       (arrSum, paramSum)  = mutableArray (reduceRank repr) "sum"
@@ -987,15 +974,7 @@ mkScan'Dim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine seed marr = do
       (arrIn,  paramIn)   = delayedArray "in" marr
       paramEnv            = envParam aenv
       --
-      config              = launchConfig dev (CUDA.incWarp dev) smem const [|| const ||]
-      smem n
-        | canShfl dev     = warps * bytes
-        | otherwise       = warps * (1 + per_warp) * bytes
-        where
-          ws        = CUDA.warpSize dev
-          warps     = n `P.quot` ws
-          per_warp  = ws + ws `P.quot` 2
-          bytes     = bytesElt tp
+      config              = launchConfig dev (CUDA.incWarp dev) (scanSMemSize dev tp) const [|| const ||]
   --
   makeOpenAccWith config uid "scan" (paramOut ++ paramSum ++ paramIn ++ paramEnv) $ do
 
@@ -1127,13 +1106,7 @@ mkScan'Dim dir uid aenv repr@(ArrayR (ShapeRsnoc shr) tp) combine seed marr = do
                                           return x
                                 return y
                               else
-                                let
-                                    go :: TypeR a -> Operands a
-                                    go TupRunit       = OP_Unit
-                                    go (TupRpair a b) = OP_Pair (go a) (go b)
-                                    go (TupRsingle t) = ir t (undef t)
-                                in
-                                return $ go tp
+                                return $ tupUndef tp
 
                       l <- i32 n
                       y <- scanBlock dir dev tp combine (Just l) x
@@ -1181,10 +1154,24 @@ mkScan'Fill
 mkScan'Fill uid aenv repr seed =
   Safe.coerce <$> mkGenerate uid aenv (reduceRank repr) (IRFun1 (const seed))
 
+scanSMemSize :: DeviceProperties -> TypeR e -> Int -> Int
+scanSMemSize dev tp n = sharedMemorySizeAdd tp warps 0
+  where
+    ws        = CUDA.warpSize dev
+    warps     = n `P.quot` ws
 
 -- Block wide scan
 -- ---------------
 
+-- Efficient block-wide (inclusive) scan using the specified operator.
+--
+-- Each block requires (#warps * (1 + 1.5*warp size)) elements of dynamically
+-- allocated shared memory.
+--
+-- Example: https://github.com/NVlabs/cub/blob/1.5.4/cub/block/specializations/block_scan_warp_scans.cuh
+--
+-- Must be called under uniform control flow within a thread block
+-- (as this function may use __syncthreads)
 scanBlock
     :: forall aenv e.
        Direction
@@ -1194,171 +1181,7 @@ scanBlock
     -> Maybe (Operands Int32)                       -- ^ number of valid elements (may be less than block size)
     -> Operands e                                   -- ^ calling thread's input element
     -> CodeGen PTX (Operands e)
-scanBlock dir dev
-  | canShfl dev = scanBlockShfl dir dev -- shfl instruction available in compute >= 3.0
-  | otherwise   = scanBlockSMem dir dev -- equivalent, slightly slower version
-
-
--- Efficient block-wide (inclusive) scan using the specified operator.
---
--- Each block requires (#warps * (1 + 1.5*warp size)) elements of dynamically
--- allocated shared memory.
---
--- Example: https://github.com/NVlabs/cub/blob/1.5.4/cub/block/specializations/block_scan_warp_scans.cuh
---
--- NOTE: [Synchronisation problems with SM_70 and greater]
---
--- This operation uses thread synchronisation. When calling this operation, it
--- is important that all active (that is, non-exited) threads of the thread
--- block participate. It seems that sm_70+ (devices with independent thread
--- scheduling) are stricter about the requirement that all non-existed threads
--- participate in every barrier.
---
--- See: https://github.com/AccelerateHS/accelerate/issues/436
---
-scanBlockSMem
-    :: forall aenv e.
-       Direction
-    -> DeviceProperties                             -- ^ properties of the target device
-    -> TypeR e
-    -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
-    -> Maybe (Operands Int32)                       -- ^ number of valid elements (may be less than block size)
-    -> Operands e                                   -- ^ calling thread's input element
-    -> CodeGen PTX (Operands e)
-scanBlockSMem dir dev tp combine nelem = warpScan >=> warpPrefix
-  where
-    int32 :: Integral a => a -> Operands Int32
-    int32 = liftInt32 . P.fromIntegral
-
-    -- Temporary storage required for each warp
-    warp_smem_elems = CUDA.warpSize dev + (CUDA.warpSize dev `P.quot` 2)
-    warp_smem_bytes = warp_smem_elems  * bytesElt tp
-
-    -- Step 1: Scan in every warp
-    warpScan :: Operands e -> CodeGen PTX (Operands e)
-    warpScan input = do
-      -- Allocate (1.5 * warpSize) elements of shared memory for each warp
-      -- (individually addressable by each warp)
-      wid   <- warpId
-      skip  <- A.mul numType wid (int32 warp_smem_bytes)
-      smem  <- dynamicSharedMem tp TypeInt32 (int32 warp_smem_elems) skip
-      scanWarpSMem dir dev tp combine smem input
-
-    -- Step 2: Collect the aggregate results of each warp to compute the prefix
-    -- values for each warp and combine with the partial result to compute each
-    -- thread's final value.
-    warpPrefix :: Operands e -> CodeGen PTX (Operands e)
-    warpPrefix input = do
-      -- Allocate #warps elements of shared memory
-      bd    <- blockDim
-      warps <- A.quot integralType bd (int32 (CUDA.warpSize dev))
-      skip  <- A.mul numType warps (int32 warp_smem_bytes)
-      smem  <- dynamicSharedMem tp TypeInt32 warps skip
-
-      -- Share warp aggregates
-      wid   <- warpId
-      lane  <- laneId
-      when (A.eq singleType lane (int32 (CUDA.warpSize dev - 1))) $ do
-        writeArray TypeInt32 smem wid input
-
-      -- Wait for each warp to finish its local scan and share the aggregate
-      __syncthreads
-
-      -- Compute the prefix value for this warp and add to the partial result.
-      -- This step is not required for the first warp, which has no carry-in.
-      if (tp, A.eq singleType wid (liftInt32 0))
-        then return input
-        else do
-          -- Every thread sequentially scans the warp aggregates to compute
-          -- their prefix value. We do this sequentially, but could also have
-          -- warp 0 do it cooperatively if we limit thread block sizes to
-          -- (warp size ^ 2).
-          steps  <- case nelem of
-                      Nothing -> return wid
-                      Just n  -> A.min singleType wid =<< A.quot integralType n (int32 (CUDA.warpSize dev))
-
-          p0     <- readArray TypeInt32 smem (liftInt32 0)
-          prefix <- iterFromStepTo tp (liftInt32 1) (liftInt32 1) steps p0 $ \step x -> do
-                      y <- readArray TypeInt32 smem step
-                      case dir of
-                        LeftToRight -> app2 combine x y
-                        RightToLeft -> app2 combine y x
-
-          case dir of
-            LeftToRight -> app2 combine prefix input
-            RightToLeft -> app2 combine input prefix
-
-
--- Warp-wide scan
--- --------------
-
--- Efficient warp-wide (inclusive) scan using the specified operator.
---
--- Each warp requires 48 (1.5 x warp size) elements of shared memory. The
--- routine assumes that it is allocated individually per-warp (i.e. can be
--- indexed in the range [0, warp size)).
---
--- Example: https://github.com/NVlabs/cub/blob/1.5.4/cub/warp/specializations/warp_scan_smem.cuh
---
-scanWarpSMem
-    :: forall aenv e.
-       Direction
-    -> DeviceProperties                             -- ^ properties of the target device
-    -> TypeR e
-    -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
-    -> IRArray (Vector e)                           -- ^ temporary storage array in shared memory (1.5 x warp size elements)
-    -> Operands e                                   -- ^ calling thread's input element
-    -> CodeGen PTX (Operands e)
-scanWarpSMem dir dev tp combine smem = scan 0
-  where
-    log2 :: Double -> Double
-    log2 = P.logBase 2
-
-    -- Number of steps required to scan warp
-    steps     = P.floor (log2 (P.fromIntegral (CUDA.warpSize dev)))
-    halfWarp  = P.fromIntegral (CUDA.warpSize dev `P.quot` 2)
-
-    -- Unfold the scan as a recursive code generation function
-    scan :: Int -> Operands e -> CodeGen PTX (Operands e)
-    scan step x
-      | step >= steps = return x
-      | otherwise     = do
-          let offset = liftInt32 (1 `P.shiftL` step)
-
-          -- share partial result through shared memory buffer
-          lane <- laneId
-          i    <- A.add numType lane (liftInt32 halfWarp)
-          writeArray TypeInt32 smem i x
-
-          __syncwarp
-
-          -- update partial result if in range
-          x'   <- if (tp, A.gte singleType lane offset)
-                    then do
-                      i' <- A.sub numType i offset    -- lane + HALF_WARP - offset
-                      x' <- readArray TypeInt32 smem i'
-                      case dir of
-                        LeftToRight -> app2 combine x' x
-                        RightToLeft -> app2 combine x x'
-
-                    else
-                      return x
-
-          __syncwarp
-
-          scan (step+1) x'
-
-
-scanBlockShfl
-    :: forall aenv e.
-       Direction
-    -> DeviceProperties                             -- ^ properties of the target device
-    -> TypeR e
-    -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
-    -> Maybe (Operands Int32)                       -- ^ number of valid elements (may be less than block size)
-    -> Operands e                                   -- ^ calling thread's input element
-    -> CodeGen PTX (Operands e)
-scanBlockShfl dir dev tp combine nelem = warpScan >=> warpPrefix
+scanBlock dir dev tp combine nelem = warpScan >=> warpPrefix
   where
     int32 :: Integral a => a -> Operands Int32
     int32 = liftInt32 . P.fromIntegral
@@ -1369,7 +1192,7 @@ scanBlockShfl dir dev tp combine nelem = warpScan >=> warpPrefix
 
     -- Step 1: Scan in every warp
     warpScan :: Operands e -> CodeGen PTX (Operands e)
-    warpScan = scanWarpShfl dir dev tp combine
+    warpScan = scanWarp dir dev tp combine
 
     -- Step 2: Collect the aggregate results of each warp to compute the prefix
     -- values for each warp and combine with the partial result to compute each
@@ -1414,15 +1237,85 @@ scanBlockShfl dir dev tp combine nelem = warpScan >=> warpPrefix
             LeftToRight -> app2 combine prefix input
             RightToLeft -> app2 combine input prefix
 
-scanWarpShfl
-    :: forall aenv e.
+-}
+
+scanWarp
+    :: forall e.
        Direction
-    -> DeviceProperties                             -- ^ properties of the target device
+    -> ScanInclusiveness
+    -> DeviceProperties                        -- ^ properties of the target device
     -> TypeR e
-    -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
-    -> Operands e                                   -- ^ calling thread's input element
-    -> CodeGen PTX (Operands e)
-scanWarpShfl dir dev tp combine = scan 0
+    -> Maybe (Bool, IRExp PTX e)               -- ^ Seed value, and whether the seed is the identity value
+    -> IRFun2 PTX (e -> e -> e)                -- ^ combination function
+    -> Maybe (Operands Int32)                  -- ^ number of items that will be reduced by this warp, when Nothing all lanes are active
+    -> Operands e                              -- ^ calling thread's input element
+    -> CodeGen PTX (Operands e, Operands e)    -- ^ the scanned values and the reduced value. The latter is the same on all lanes of the warp.
+-- In an inclusive scan without a seed the first value is undefined.
+scanWarp dir ScanExclusive dev tp seed combine size value = do
+  mask <- case size of
+    Nothing -> return Nothing
+    Just sz -> do
+      OP_Word32 mask <- A.fromIntegral TypeInt32 numType sz >>= maskTrailing TypeWord32
+      return $ Just mask
+
+  lane <- laneId
+  isFirst <- firstLane dir dev size >>= A.eq singleType lane
+
+  (value', seed') <- case seed of
+    Nothing -> return (value, Nothing)
+    Just (True, s) -> do
+      -- Seed is an identity value, so we don't need to combine it with the
+      -- first value. We do need the seed, as the first lane of this exclusive
+      -- scan needs this value.
+      return (value, Just s)
+    Just (False, s) -> do
+      OP_Pair value' seed' <- A.ifThenElse (TupRpair tp tp, return isFirst)
+        ( do
+          seed' <- s
+          value' <- case dir of
+            LeftToRight -> app2 combine seed' value
+            RightToLeft -> app2 combine value seed'
+          return $ OP_Pair value' seed'
+        )
+        ( return $ OP_Pair value $ undefs tp
+        )
+      return (value', Just $ return seed')
+  (inclusive, reduced) <- scanWarp dir ScanInclusive dev tp Nothing combine size value'
+  exclusive <- __shfl (shuffleOp dir) tp mask inclusive (liftWord32 1)
+  case seed' of
+    Nothing ->
+      -- If there is no identity or seed, then the first value is undefined.
+      -- Hence we don't need to 'fix' anything there.
+      return (exclusive, reduced)
+    Just seed'' -> do -- seed or identity
+      seed''' <- seed''
+      -- Change value of lane zero to the seed or identity
+      result <- select tp isFirst seed''' exclusive
+      return (result, reduced)
+scanWarp dir ScanInclusive dev tp (Just (False, seed)) combine size value = do
+  -- Inclusive scan with a seed, that is not the identity value.
+  lane <- laneId
+  value' <- A.ifThenElse (tp, firstLane dir dev size >>= A.eq singleType lane)
+    ( do
+      seed' <- seed
+      value' <- case dir of
+        LeftToRight -> app2 combine seed' value
+        RightToLeft -> app2 combine value seed'
+      return value'
+    )
+    ( return value
+    )
+  scanWarp dir ScanInclusive dev tp Nothing combine size value'
+scanWarp dir ScanInclusive dev tp (Just (True, _)) combine size value =
+  -- An inclusive with an identity value as seed can ignore the seed.
+  scanWarp dir ScanInclusive dev tp Nothing combine size value
+scanWarp dir ScanInclusive dev tp Nothing combine size value = do
+  mask <- case size of
+    Nothing -> return Nothing
+    Just sz -> do
+      OP_Word32 mask <- A.fromIntegral TypeInt32 numType sz >>= maskTrailing TypeWord32
+      return $ Just mask
+  scan mask 0 value
   where
     log2 :: Double -> Double
     log2 = P.logBase 2
@@ -1431,34 +1324,82 @@ scanWarpShfl dir dev tp combine = scan 0
     steps = P.floor (log2 (P.fromIntegral (CUDA.warpSize dev)))
 
     -- Unfold the scan as a recursive code generation function
-    scan :: Int -> Operands e -> CodeGen PTX (Operands e)
-    scan step x
-      | step >= steps = return x
+    scan :: Maybe (Operand Word32) -> Int -> Operands e -> CodeGen PTX (Operands e, Operands e)
+    scan mask step x
+      | step >= steps = do
+        -- x is the scanned value. Since this is an inclusive scan,
+        -- the last lane has the reduced value of all inputs.
+        reduced <- lastLane dir dev size >>= A.fromIntegral TypeInt32 numType >>= __shfl_idx tp mask x
+        return (x, reduced)
       | otherwise     = do
           let offset = 1 `P.shiftL` step
 
           -- share partial result through shared memory buffer
-          y    <- __shfl_up tp x (liftWord32 offset)
+          y    <- __shfl (shuffleOp dir) tp mask x (liftWord32 offset)
           lane <- laneId
 
+          -- check whether this thread needs to do anything
+          let condition = case dir of
+                LeftToRight -> A.gte singleType lane $ liftInt32 $ P.fromIntegral $ offset
+                RightToLeft -> do
+                  other <- A.add numType lane $ liftInt32 $ P.fromIntegral $ offset
+                  first <- firstLane RightToLeft dev size
+                  A.lte singleType other first
+
           -- update partial result if in range
-          x'   <- if (tp, A.gte singleType lane (liftInt32 . P.fromIntegral $ offset))
+          x'   <- if (tp, condition)
                     then do
                       case dir of
                         LeftToRight -> app2 combine y x
                         RightToLeft -> app2 combine x y
-
                     else
                       return x
 
-          scan (step+1) x'
+          scan mask (step+1) x'
 
--- Utilities
--- ---------
+shuffleOp :: Direction -> ShuffleOp
+shuffleOp LeftToRight = Up
+shuffleOp RightToLeft = Down
 
-i32 :: Operands Int -> CodeGen PTX (Operands Int32)
-i32 = A.fromIntegral integralType numType
+firstLane :: Direction -> DeviceProperties -> Maybe (Operands Int32) -> CodeGen PTX (Operands Int32)
+firstLane LeftToRight _ _ =
+  return $ liftInt32 0
+firstLane RightToLeft dev Nothing =
+  return $ liftInt32 $ P.fromIntegral (CUDA.warpSize dev) - 1
+firstLane RightToLeft _ (Just sz) =
+  A.sub numType sz (liftInt32 1)
 
-int :: Operands Int32 -> CodeGen PTX (Operands Int)
-int = A.fromIntegral integralType numType
+lastLane :: Direction -> DeviceProperties -> Maybe (Operands Int32) -> CodeGen PTX (Operands Int32)
+lastLane LeftToRight = firstLane RightToLeft
+lastLane RightToLeft = firstLane LeftToRight
 
+-- In a warp, scan the values from shared memory. Computes a left-to-right
+-- exclusive scan. The first value of the output is undefined, unless an
+-- identity value is given. Returns the reduced value.
+scanFromSMem
+    :: forall e.
+       Direction
+    -> DeviceProperties
+    -> TypeR e
+    -> Maybe (IRExp PTX e) -- Identity
+    -> IRFun2 PTX (e -> e -> e)
+    -> Int
+    -> Operand Int32 -- Number of warps = number of used entries in shared memory
+    -> TupR Operand (Distribute Ptr (Distribute SizedArray (BufferEltR e)))
+    -> CodeGen PTX (Operands e)
+scanFromSMem dir dev tp identity fun maxSize size smem
+  | maxSize /= CUDA.warpSize dev = internalError "Expected that the maximum number of warps is equal to the warp size"
+  | otherwise = do
+    lane <- laneId
+    active <- A.lt singleType lane (OP_Int32 size)
+    masked tp active $ do
+      ptr <- tupleArrayGep tp smem lane
+      value <- tupleLoad tp ptr
+      (scanned, reduced) <- scanWarp dir ScanExclusive dev tp ((True,) <$> identity) fun (Just $ OP_Int32 size) value
+      tupleStore tp ptr scanned
+      return reduced
+
+-- tupUndef :: TypeR a -> Operands a
+-- tupUndef TupRunit       = OP_Unit
+-- tupUndef (TupRpair a b) = OP_Pair (tupUndef a) (tupUndef b)
+-- tupUndef (TupRsingle t) = ir t (undef t)

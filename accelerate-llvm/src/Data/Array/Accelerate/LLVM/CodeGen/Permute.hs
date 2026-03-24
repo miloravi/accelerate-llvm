@@ -41,6 +41,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
 import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.CodeGen.Type
+import Data.Array.Accelerate.LLVM.CodeGen.Intrinsic
 import Data.Array.Accelerate.LLVM.Foreign
 
 import LLVM.AST.Type.Instruction
@@ -82,7 +83,7 @@ data IRPermuteFun arch t where
 -- let-bindings.
 --
 llvmOfPermuteFun
-    :: forall arch aenv e. CompileForeignExp arch
+    :: forall arch aenv e. (CompileForeignExp arch, Intrinsic arch)
     => Fun aenv (e -> e -> e)
     -> Gamma aenv
     -> IRPermuteFun arch (e -> e -> e)
@@ -217,7 +218,7 @@ atomicCAS_rmw' t i update addr = withDict (integralElt i) $ do
   exit  <- newBlock "rmw.exit"
 
   addr' <- instr' $ PtrCast (PtrPrimType (ScalarPrimType si) defaultAddrSpace) addr
-  init' <- instr' $ Load si NonVolatile addr'
+  init' <- instr' $ Load NonVolatile addr' Nothing
   old'  <- fresh  $ TupRsingle si
   top   <- br spin
 
@@ -308,7 +309,7 @@ atomicCAS_cmp' t i cmp addr val = withDict (singleElt t) $ do
   old   <- fresh  $ TupRsingle $ SingleScalarType t
 
   -- Read the current value at the address
-  start <- instr' $ Load (SingleScalarType t) NonVolatile addr
+  start <- instr' $ Load NonVolatile addr Nothing
   top   <- br test
 
   -- Compare the new value with the current contents at that memory slot. If the

@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP                 #-}
 {-# LANGUAGE DataKinds           #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE MultiWayIf          #-}
@@ -9,6 +8,7 @@
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE TypeOperators       #-}
 {-# LANGUAGE ViewPatterns        #-}
+{-# OPTIONS_GHC -Wno-orphans     #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX.CodeGen.Base
 -- Copyright   : [2014..2020] The Accelerate Team
@@ -34,17 +34,21 @@ module Data.Array.Accelerate.LLVM.PTX.CodeGen.Base (
   atomicAdd_f,
   nanosleep,
 
+  -- Utilities related to thread ids & intrinsics
+  perWarp, perWarp', perThreadBlock, warpPerThreadBlock,
+
   -- Barriers and synchronisation
   __syncthreads, __syncthreads_count, __syncthreads_and, __syncthreads_or,
   __syncwarp, __syncwarp_mask,
   __threadfence_block, __threadfence_grid,
 
   -- Warp shuffle instructions
+  __shfl, ShuffleOp(..),
   __shfl_up, __shfl_down, __shfl_idx, __broadcast,
-  canShfl,
 
   -- Shared memory
-  staticSharedMem,
+  staticSharedMem, staticSharedMemTuple,
+  sharedMemorySizeAdd,
   dynamicSharedMem,
   sharedMemAddrSpace, sharedMemVolatility,
 
@@ -70,7 +74,7 @@ import Data.Array.Accelerate.LLVM.State
 import Data.Array.Accelerate.Representation.Elt
 import Data.Array.Accelerate.Representation.Type
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Constant        as A
-import Data.Array.Accelerate (KernelMetadata)
+import Data.Array.Accelerate.Backend (KernelMetadata)
 
 import Foreign.CUDA.Analysis                                        ( Compute(..), computeCapability )
 import qualified Foreign.CUDA.Analysis                              as CUDA
@@ -90,14 +94,15 @@ import LLVM.AST.Type.Module
 import LLVM.AST.Type.Name
 import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Representation
-import qualified Text.LLVM                                          as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty     as LP
 
 import Control.Applicative
 import Control.Monad                                                ( void )
-import Control.Monad.State                                          ( gets )
+import Control.Monad.Reader                                         ( asks )
 import Data.Bits
 import Data.Proxy
 import Data.String
+import Data.Maybe
 import Foreign.Storable
 import Prelude                                                      as P
 
@@ -131,6 +136,30 @@ laneMask_le = specialPTXReg "llvm.nvvm.read.ptx.sreg.lanemask.le"
 laneMask_gt = specialPTXReg "llvm.nvvm.read.ptx.sreg.lanemask.gt"
 laneMask_ge = specialPTXReg "llvm.nvvm.read.ptx.sreg.lanemask.ge"
 
+-- Executes code once per warp (instead of once per thread)
+perWarp :: CodeGen PTX () -> CodeGen PTX ()
+perWarp action = do
+  lane <- laneId
+  when (A.eq singleType lane (liftInt32 0)) action
+
+perWarp' :: TypeR e -> CodeGen PTX (Operands e) -> CodeGen PTX (Operands e)
+perWarp' tp action = do
+  lane <- laneId
+  value <- A.ifThenElse
+    (tp, A.eq singleType lane (liftInt32 0))
+    action
+    (return $ A.undefs tp)
+  __broadcast tp Nothing value
+
+-- Executes code in only one warp per threadblock
+warpPerThreadBlock :: CodeGen PTX () -> CodeGen PTX ()
+warpPerThreadBlock action = do
+  id <- warpId
+  when (A.eq singleType id (liftInt32 0)) action
+
+-- Executes code only once per thread block (instead of once per thread)
+perThreadBlock :: CodeGen PTX () -> CodeGen PTX ()
+perThreadBlock = warpPerThreadBlock . perWarp
 
 -- | NOTE: The special register %warpid as volatile value and is not guaranteed
 --         to be constant over the lifetime of a thread or thread block.
@@ -141,7 +170,7 @@ laneMask_ge = specialPTXReg "llvm.nvvm.read.ptx.sreg.lanemask.ge"
 --
 warpId :: CodeGen PTX (Operands Int32)
 warpId = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
   tid <- threadIdx
   A.quot integralType tid (A.liftInt32 (P.fromIntegral (CUDA.warpSize dev)))
 
@@ -250,16 +279,10 @@ __syncwarp = __syncwarp_mask (liftWord32 0xffffffff)
 --
 __syncwarp_mask :: HasCallStack => Operands Word32 -> CodeGen PTX ()
 __syncwarp_mask mask = do
-  llvmver <- getLLVMversion
-  dev <- liftCodeGen $ gets ptxDeviceProperties
-  case (computeCapability dev >= Compute 7 0, llvmver >= 6) of
-    (True, True) ->
-      void $ call
-        (lamUnnamed primType $ Body VoidType (Just Tail) "llvm.nvvm.bar.warp.sync")
-        (ArgumentsCons (op primType mask) [] ArgumentsNil)
-        [NoUnwind, NoDuplicate, Convergent]
-    (True, False) -> internalError "LLVM-6.0 or above is required for Volta devices and later"
-    (False, _) -> return ()
+  void $ call
+    (lamUnnamed primType $ Body VoidType (Just Tail) "llvm.nvvm.bar.warp.sync")
+    (ArgumentsCons (op primType mask) [] ArgumentsNil)
+    [NoUnwind, NoDuplicate, Convergent]
 
 
 -- | Ensure that all writes to shared and global memory before the call to
@@ -306,7 +329,7 @@ atomicAdd_f t addr val = do
          void . instr' $ AtomicRMW (FloatingNumType t) NonVolatile RMW.Add addr val (CrossThread, AcquireRelease)
 
      | otherwise ->
-         error "atomic fadd not supported on llvm <10"
+         internalError "LLVM < 10 not supported"
 
 
 -- Warp shuffle functions
@@ -331,36 +354,32 @@ data ShuffleOp
 
 -- | Each thread gets the value provided by lower threads
 --
-__shfl_up :: TypeR a -> Operands a -> Operands Word32 -> CodeGen PTX (Operands a)
-__shfl_up = shfl Up
+__shfl_up :: TypeR a -> Maybe (Operand Word32) -> Operands a -> Operands Word32 -> CodeGen PTX (Operands a)
+__shfl_up = __shfl Up
 
 -- | Each thread gets the value provided by higher threads
 --
-__shfl_down :: TypeR a -> Operands a -> Operands Word32 -> CodeGen PTX (Operands a)
-__shfl_down  = shfl Down
+__shfl_down :: TypeR a -> Maybe (Operand Word32) -> Operands a -> Operands Word32 -> CodeGen PTX (Operands a)
+__shfl_down  = __shfl Down
 
 -- | shfl_idx takes an argument representing the source lane index.
 --
-__shfl_idx :: TypeR a -> Operands a -> Operands Word32 -> CodeGen PTX (Operands a)
-__shfl_idx = shfl Idx
+__shfl_idx :: TypeR a -> Maybe (Operand Word32) -> Operands a -> Operands Word32 -> CodeGen PTX (Operands a)
+__shfl_idx = __shfl Idx
 
 -- | Distribute the value from lane 0 across the warp
 --
-__broadcast :: TypeR a -> Operands a -> CodeGen PTX (Operands a)
-__broadcast aR a = __shfl_idx aR a (liftWord32 0)
-
--- Warp shuffle instructions are available for compute capability >= 3.0
---
-canShfl :: DeviceProperties -> Bool
-canShfl dev = CUDA.computeCapability dev >= Compute 3 0
+__broadcast :: TypeR a -> Maybe (Operand Word32) -> Operands a -> CodeGen PTX (Operands a)
+__broadcast aR mask a = __shfl_idx aR mask a (liftWord32 0)
 
 
-shfl :: ShuffleOp
+__shfl :: ShuffleOp
      -> TypeR a
+     -> Maybe (Operand Word32)
      -> Operands a
      -> Operands Word32
      -> CodeGen PTX (Operands a)
-shfl sop tR val delta = go tR val
+__shfl sop tR mask val delta = go tR val
   where
     delta' :: Operand Word32
     delta' = op integralType delta
@@ -435,13 +454,13 @@ shfl sop tR val delta = go tR val
               let raw :: LP.Type -> LP.Instr -> CodeGen PTX (LP.Typed LP.Value)
                   raw ty ins = do
                     name <- freshLocalName
-                    instr_ (LP.Result (nameToPrettyI name) ins [])
+                    instr_ (LP.Result (nameToPrettyI name) ins [] [])
                     return (LP.Typed ty (LP.ValIdent (nameToPrettyI name)))
 
                   rawUp :: Type u -> LP.Instr -> CodeGen PTX (Operand u)
                   rawUp ty ins = do
                     name <- freshLocalName
-                    instr_ (LP.Result (nameToPrettyI name) ins [])
+                    instr_ (LP.Result (nameToPrettyI name) ins [] [])
                     return (LocalReference ty name)
 
 
@@ -461,11 +480,11 @@ shfl sop tR val delta = go tR val
                         t3 = downcast t3Up
 
                     b <- raw t1 (LP.Conv LP.BitCast (downcast (op v a)) t1)
-                    c <- raw t2 (LP.Conv LP.ZExt b t2)
+                    c <- raw t2 (LP.Conv (LP.ZExt False) b t2)
                     d <- rawUp t3Up (LP.Conv LP.BitCast c t3)
                     e <- vector v' (ir v' d)
                     f <- raw t2 (LP.Conv LP.BitCast (downcast (op v' e)) t2)
-                    g <- raw t1 (LP.Conv LP.Trunc f t1)
+                    g <- raw t1 (LP.Conv (LP.Trunc False False) f t1)
                     h <- rawUp t0Up (LP.Conv LP.BitCast g t0)
                     return (ir v h)
                in
@@ -476,7 +495,7 @@ shfl sop tR val delta = go tR val
     num (FloatingNumType t) = floating t
 
     integral :: forall s. IntegralType s -> Operands s -> CodeGen PTX (Operands s)
-    integral TypeInt32 a = shfl_op sop ShuffleInt32 delta' a
+    integral TypeInt32 a = shfl_op sop ShuffleInt32 mask delta' a
     integral t         a
       | IntegralDict <- integralDict t
       = case finiteBitSize (undefined::s) of
@@ -496,7 +515,7 @@ shfl sop tR val delta = go tR val
             return d
 
     floating :: FloatingType s -> Operands s -> CodeGen PTX (Operands s)
-    floating TypeFloat  a = shfl_op sop ShuffleFloat delta' a
+    floating TypeFloat  a = shfl_op sop ShuffleFloat mask delta' a
     floating TypeDouble a = do
       b <- A.bitcast scalarType (scalarType @(Vec 2 Int32)) a
       c <- vector (VectorType 2 singleType) b
@@ -517,12 +536,13 @@ shfl_op
     :: forall a.
        ShuffleOp
     -> ShuffleType a
+    -> Maybe (Operand Word32)       -- mask of active threads, or Nothing if all threads are active. See https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-sync-intrinsic-constraints
     -> Operand Word32               -- delta
     -> Operands a                   -- value to give
     -> CodeGen PTX (Operands a)     -- value received
-shfl_op sop t delta val
+shfl_op sop t mask delta val
   | Refl <- result t = do
-  dev <- liftCodeGen $ gets ptxDeviceProperties
+  dev <- liftCodeGen $ asks ptxDeviceProperties
 
   let
       -- The CUDA __shfl* instruction take an optional final parameter
@@ -546,14 +566,10 @@ shfl_op sop t delta val
       -- way, except they start with a 'mask' argument specifying which
       -- threads participate in the shuffle.
       --
-      mask :: Operand Int32
-      mask  = A.integral integralType (-1) -- all threads participate
+      mask' :: Operand Word32
+      mask' = fromMaybe (A.integral integralType 0xFFFFFFFF) mask -- if mask is Nothing, all threads participate
 
-      useSyncShfl = CUDA.computeCapability dev >= Compute 7 0
-
-      sync  = if useSyncShfl then "sync." else ""
-      asm   = "llvm.nvvm.shfl."
-           <> sync
+      asm   = "llvm.nvvm.shfl.sync."
            <> case sop of
                 Idx  -> "idx."
                 Up   -> "up."
@@ -567,20 +583,10 @@ shfl_op sop t delta val
                 ShuffleInt32 -> primType :: PrimType Int32
                 ShuffleFloat -> primType :: PrimType Float
 
-  if useSyncShfl then
-    -- Arguments:
-    -- mask, value, delta, width
-    call
-      (lamUnnamed primType $ lamUnnamed t_val $ lamUnnamed primType $ lamUnnamed primType $ Body (PrimType t_val) (Just Tail) asm)
-      (ArgumentsCons mask [] $ ArgumentsCons (op t_val val) [] $ ArgumentsCons delta [] $ ArgumentsCons width [] ArgumentsNil)
-      [Convergent, NoUnwind, InaccessibleMemOnly]
-  else
-    -- Arguments:
-    -- value, delta, width
-    call
-      (lamUnnamed t_val $ lamUnnamed primType $ lamUnnamed primType $ Body (PrimType t_val) (Just Tail) asm)
-      (ArgumentsCons (op t_val val) [] $ ArgumentsCons delta [] $ ArgumentsCons width [] ArgumentsNil)
-      [Convergent, NoUnwind, InaccessibleMemOnly]
+  call
+    (lamUnnamed primType $ lamUnnamed t_val $ lamUnnamed primType $ lamUnnamed primType $ Body (PrimType t_val) (Just Tail) asm)
+    (ArgumentsCons mask' [] $ ArgumentsCons (op t_val val) [] $ ArgumentsCons delta [] $ ArgumentsCons width [] ArgumentsNil)
+    [Convergent, NoUnwind, InaccessibleMemOnly]
   where
     result :: ShuffleType a -> a :~: Result a
     result ShuffleFloat = Refl
@@ -622,13 +628,13 @@ sharedMemVolatility = Volatile
 -- instead. The assigned value is 'undef', just like what Clang generates for
 -- the internal sdata C++ declaration.
 staticSharedMem
-    :: IRBufferScope
-    -> ScalarType e
+    :: ScalarType e
     -> Word64
-    -> CodeGen PTX (IRBuffer e)
-staticSharedMem scope tp n = do
+    -> CodeGen PTX (Operand (Ptr (SizedArray (BufferEltR e))))
+staticSharedMem tp n = do
   name <- freshGlobalName
-  let arrayTp = ArrayPrimType n (ScalarPrimType tp)
+  let tp' = bufferEltR tp
+  let arrayTp = ArrayPrimType n tp'
   let ptrArrayTp = PrimType (PtrPrimType arrayTp sharedMemAddrSpace)
   let sm = ConstantOperand $ GlobalReference ptrArrayTp name
 
@@ -639,21 +645,34 @@ staticSharedMem scope tp n = do
         , LP.gaVisibility = Nothing
         , LP.gaAddrSpace = sharedMemAddrSpace
         , LP.gaConstant = False }
-    , LP.globalType = LP.Array n (downcast tp)
+    , LP.globalType = downcast arrayTp
     , LP.globalValue = Just LP.ValUndef
-    , LP.globalAlign = Just (4 `P.max` P.fromIntegral (bytesElt $ TupRsingle tp))
+    , LP.globalAlign = Just (4 `P.max` P.fromIntegral (P.snd $ primSizeAlignment tp'))
     , LP.globalMetadata = mempty
     }
 
   -- Return a pointer to the first element of the __shared__ memory array.
   -- We do this rather than just returning the global reference directly due
   -- to how __shared__ memory needs to be indexed with the GEP instruction.
-  p <- instr' $ GetElementPtr
-      $ GEP sm (A.num numType 0 :: Operand Int32)
-      $ GEPArray (A.num numType 0 :: Operand Int32) GEPEmpty
+  -- p <- instr' $ GetElementPtr
+  --     $ GEP sm (A.num numType 0 :: Operand Int32)
+  --     $ GEPArray (A.num numType 0 :: Operand Int32) GEPEmpty
 
-  return $ IRBuffer p sharedMemAddrSpace sharedMemVolatility scope Nothing
+  return sm
 
+staticSharedMemTuple
+  :: forall e.
+     TypeR e
+  -> Word64
+  -> CodeGen PTX (TupR Operand (Distribute Ptr (Distribute SizedArray (BufferEltR e))))
+staticSharedMemTuple tp n = case tp of
+  TupRunit -> return TupRunit
+  TupRpair t1 t2 -> TupRpair <$> staticSharedMemTuple t1 n <*> staticSharedMemTuple t2 n
+  TupRsingle t
+    | t' <- bufferEltR t
+    , Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr t'
+    , Refl <- reprIsSingle @PrimType @(BufferEltR e) @SizedArray t' ->
+      TupRsingle <$> staticSharedMem t n
 
 -- External declaration in shared memory address space. This must be declared in
 -- order to access memory allocated dynamically by the CUDA driver. This results
@@ -680,6 +699,24 @@ initialiseDynamicSharedMemory = do
                                  (ScalarConstant (scalarType @Int32) 0)
                                  (GEPArray (ScalarConstant (scalarType @Int32) 0) GEPEmpty))
 
+sharedMemorySizeAdd
+  :: TypeR e
+  -> Int -- number of array elements
+  -> Int -- #bytes of shared memory the have already been allocated
+  -> Int
+sharedMemorySizeAdd tp n i = case tp of
+  TupRunit -> i
+  TupRpair t2 t1 ->
+    -- First handle the second element of the tuple, then the first,
+    -- to match the behaviour of dynamicSharedMem
+    sharedMemorySizeAdd t2 n $ sharedMemorySizeAdd t1 n i
+  TupRsingle t ->
+    let
+      bytes = scalarTypeSize t
+      -- Align 'i' to the alignment of t
+      aligned = alignToInt (scalarTypeAlignment t) i
+    in
+      aligned + bytes * n
 
 {- dynamicSharedMem
     :: forall e int.
@@ -701,10 +738,14 @@ dynamicSharedMem tp int n@(op int -> m) (op int -> offset)
           (i2, p2) <- go t2 i1
           return $ (i2, OP_Pair p2 p1)
         go (TupRsingle t)   i  = do
-          p <- instr' $ GetElementPtr (GEP1 scalarType smem i)
+          let bytes = bytesElt (TupRsingle t)
+          let align = scalarAlignment t
+          i' <- instr' $ Add numTp i (A.integral int $ P.fromIntegral $ align - 1)
+          aligned <- instr' $ BAnd int i' (A.integral int $ P.fromIntegral $ Data.Bits.complement $ align - 1)
+          p <- instr' $ GetElementPtr (GEP1 scalarType smem aligned)
           q <- instr' $ PtrCast (PtrPrimType (ScalarPrimType t) sharedMemAddrSpace) p
-          a <- instr' $ Mul numTp m (A.integral int (P.fromIntegral (bytesElt (TupRsingle t))))
-          b <- instr' $ Add numTp i a
+          a <- instr' $ Mul numTp m (A.integral int (P.fromIntegral bytes))
+          b <- instr' $ Add numTp aligned a
           return (b, ir t (unPtr q))
     --
     (_, ad) <- go tp offset
@@ -728,11 +769,11 @@ dynamicSharedMem
     -> CodeGen PTX (Operands Int32, IRBuffer e)
 dynamicSharedMem scope tp n offset = do
   smem <- initialiseDynamicSharedMemory
-  let tpSize = P.fromIntegral $ bytesElt $ TupRsingle tp
+  let tpSize = P.fromIntegral $ scalarTypeSize tp
   -- Align 'offset' to compute start offset & pointer
   OP_Int32 start <- alignTo tpSize offset
   startPtr <- instr' $ GetElementPtr (GEP1 smem start)
-  startPtr' <- instr' $ PtrCast (PtrPrimType (ScalarPrimType tp) sharedMemAddrSpace) startPtr
+  startPtr' <- instr' $ PtrCast (PtrPrimType (bufferEltR tp) sharedMemAddrSpace) startPtr
   -- Compute allocated size and end of this allocation
   size' <- A.mul numType n $ OP_Int32 $ A.integral TypeInt32 $ tpSize
   end <- A.add numType (OP_Int32 start) size'
@@ -746,6 +787,11 @@ alignTo :: Int32 -> Operands Int32 -> CodeGen PTX (Operands Int32)
 alignTo align ptr = do
   x <- A.add numType ptr $ OP_Int32 $ A.integral TypeInt32 $ align - 1
   A.band TypeInt32 x $ OP_Int32 $ A.integral TypeInt32 $ Data.Bits.complement $ align - 1
+
+-- Align 'ptr' to the given alignment.
+-- Assumes 'align' is a power of 2.
+alignToInt :: Int -> Int -> Int
+alignToInt align ptr = (ptr + align - 1) .&. Data.Bits.complement (align - 1)
 
 -- Other functions
 -- ---------------

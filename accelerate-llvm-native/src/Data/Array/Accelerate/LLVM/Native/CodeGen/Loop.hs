@@ -37,12 +37,11 @@ import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Instruction
 import LLVM.AST.Type.Instruction.Atomic
 import LLVM.AST.Type.Instruction.Volatile
+import LLVM.AST.Type.Constant
 import qualified LLVM.AST.Type.Instruction.RMW as RMW
-import Control.Monad (void)
 import Control.Monad.Trans
 import Control.Monad.State
 import Data.Array.Accelerate.LLVM.CodeGen.Base
-import LLVM.AST.Type.Function
 import LLVM.AST.Type.Name
 
 -- For debugging
@@ -212,7 +211,7 @@ workassistLoop counter firstIndex size doWork = do
 
   doWork seqMode index
 
-  nextIndex <- atomicAdd Monotonic counter (integral TypeWord64 1)
+  nextIndex <- Loop.atomicAdd Monotonic counter (integral TypeWord64 1)
   condition <- lt singleType (OP_Word64 nextIndex) (OP_Word64 size)
   indexPlusOne <- add numType (OP_Word64 index) (liftWord64 1)
   nextSeq' <- eq singleType indexPlusOne (OP_Word64 nextIndex)

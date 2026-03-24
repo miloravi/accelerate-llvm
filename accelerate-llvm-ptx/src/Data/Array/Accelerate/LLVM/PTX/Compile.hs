@@ -1,10 +1,9 @@
-{-# LANGUAGE BangPatterns      #-}
-{-# LANGUAGE CPP               #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE TemplateHaskell   #-}
 {-# LANGUAGE TypeFamilies      #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -Wno-orphans   #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX.Compile
 -- Copyright   : [2014..2020] The Accelerate Team
@@ -41,13 +40,13 @@ import qualified Foreign.CUDA.Analysis                              as CUDA
 
 import qualified LLVM.AST.Type.Name                                 as LLVM
 
-import qualified Text.LLVM                                          as LP
-import qualified Text.LLVM.PP                                       as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty     as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty.PP  as LP
 import qualified Text.PrettyPrint                                   as Pretty
 
 import Control.DeepSeq
 import Control.Monad                                                ( when )
-import Control.Monad.State
+import Control.Monad.Reader
 import Data.ByteString.Short                                        ( ShortByteString )
 import Data.List                                                    ( intercalate )
 import qualified Data.List.NonEmpty                                 as NE
@@ -81,12 +80,16 @@ compile uid name config module' = do
   cacheFile <- cacheOfUID uid
   -- Generate code for this Acc operation
   --
-  dev                  <- gets ptxDeviceProperties
+  dev                  <- asks ptxDeviceProperties
   let CUDA.Compute m n = CUDA.computeCapability dev
   let arch             = printf "sm_%d%d" m n
   let ast              = downcast module'
 
   libdevice_bc <- liftIO libdeviceBitcodePath
+
+  case isDeviceSupported (CUDA.computeCapability dev) of
+    Nothing -> return ()  -- all fine
+    Just err -> internalError string err
 
   -- Lower the generated LLVM into a CUBIN object code.
   --
@@ -147,13 +150,9 @@ compile uid name config module' = do
 
         Debug.traceM Debug.dump_cc ("Arguments to clang: " % shown) clangArgs
 
-        -- Remove some diagnostics from clang (and subprocesses) output that we
-        -- know are fine. See filterClangStderr. Unfortunately, System.Process
-        -- does not have a combinator for "give me stdout and stderr but throw
-        -- exception on ExitFailure", so we do it manually.
         (clangEC, clangOut, clangErr) <- readProcessWithExitCode clangExePath clangArgs unoptimisedText
         putStr clangOut
-        putStr (filterClangStderr clangErr)
+        putStr clangErr
         case clangEC of
           ExitSuccess -> return ()
           ExitFailure code -> do
@@ -227,33 +226,14 @@ exported (I think), which is what we want.
 instance NFData' ObjectR where
   rnf' (ObjectR !_ !_ !_ path) = rnf path
 
-filterClangStderr :: String -> String
-filterClangStderr = unlines . filter (not . isShflSyncWarn) . lines
-  where
-    -- ptxas warns about use of shfl instructions without the .sync suffix on
-    -- CC 6.0, because such non-sync shuffles are deprecated (and indeed
-    -- removed in CC 7.0). We still use them in CC 6.0 (and not any more in CC
-    -- 7.0) because the shfl.sync in CC 6.0 has restrictions:
-    --
-    -- > For .target `sm_6x` or below, all threads in `membermask` must execute
-    -- > the same `shfl.sync` instruction in convergence, and only threads
-    -- > belonging to some `membermask` can be active when the `shfl.sync`
-    -- > instruction is executed. Otherwise, the behavior is undefined.
-    -- (https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-shfl-sync)
-    --
-    -- Perhaps we do use the shuffles in convergence, but we don't want to risk
-    -- it. Hence in CC 6.0, we still use non-sync shuffles.
-    --
-    -- The ptxas warning cannot be turned off, however, and is **incredibly**
-    -- noisy (there's a warning for every single shfl instruction). Hence we
-    -- filter them out here.
-    --
-    -- > ptxas /tmp/--f8a421.s, line 119; warning : Instruction 'shfl' without '.sync' is deprecated since PTX ISA version 6.0 and will be discontinued in a future PTX ISA version
-    isShflSyncWarn line =
-      let (presemi, postsemi) = break (== ';') line
-      in takeWhile (/= ' ') presemi == "ptxas" &&
-           postsemi == "; warning : Instruction 'shfl' without '.sync' is deprecated since " ++
-                       "PTX ISA version 6.0 and will be discontinued in a future PTX ISA version"
+-- | Returns a human-readable error message in case the device is unsupported,
+-- and Nothing if everything is alright.
+isDeviceSupported :: CUDA.Compute -> Maybe String
+isDeviceSupported cc@(CUDA.Compute m _)
+  -- We require shfl sync instructions which are available only from CC 7.0.
+  | m >= 7 = Nothing
+  | otherwise = Just $
+      "Your GPU has compute capability " ++ show cc ++ ", but only >= 7.0 is supported."
 
 accPreludePTX :: String
 accPreludePTX = unlines

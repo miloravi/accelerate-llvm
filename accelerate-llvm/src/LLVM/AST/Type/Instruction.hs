@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP                   #-}
 {-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE FlexibleInstances     #-}
@@ -7,10 +6,6 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE RankNTypes            #-}
-{-# LANGUAGE TemplateHaskell       #-}
-{-# LANGUAGE TypeApplications      #-}
-{-# LANGUAGE TypeOperators         #-}
-{-# LANGUAGE TypeSynonymInstances  #-}
 {-# LANGUAGE ViewPatterns          #-}
 {-# OPTIONS_HADDOCK hide #-}
 -- |
@@ -40,7 +35,7 @@ import LLVM.AST.Type.Instruction.Compare                  ( Ordering(..) )
 import LLVM.AST.Type.Instruction.RMW                      ( RMWOperation )
 import LLVM.AST.Type.Instruction.Volatile                 ( Volatility(..) )
 
-import qualified Text.LLVM                                as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty as LP
 
 import Data.Array.Accelerate.AST                          ( PrimBool )
 import Data.Array.Accelerate.AST.Idx
@@ -218,31 +213,17 @@ data Instruction a where
 
   -- <http://llvm.org/docs/LangRef.html#load-instruction>
   --
-  -- TODO: Instead of a specific Load instructions, could we have a single one?
-  -- The reason we currently have alternatives is that Load requires a
-  -- ScalarType, but could we just drop that?
-  Load            :: ScalarType a
-                  -> Volatility
+  Load            :: Volatility
                   -> Operand (Ptr a)
+                  -> Maybe Align
                   -> Instruction a
-
-  LoadBool        :: Volatility
-                  -> Operand (Ptr Bool)
-                  -> Instruction Bool
-
-  LoadPtr         :: Volatility
-                  -> Operand (Ptr (Ptr a))
-                  -> Instruction (Ptr a)
-
-  LoadStruct      :: Volatility
-                  -> Operand (Ptr (Struct a))
-                  -> Instruction (Struct a)
 
   -- <http://llvm.org/docs/LangRef.html#store-instruction>
   --
   Store           :: Volatility
                   -> Operand (Ptr a)
                   -> Operand a
+                  -> Maybe Align
                   -> Instruction ()
 
   -- <http://llvm.org/docs/LangRef.html#getelementptr-instruction>
@@ -399,6 +380,7 @@ data Named ins a where
   (:=) :: Name a -> ins a -> Named ins a
   Do   :: ins ()          -> Named ins ()
 
+type Align = Int
 
 -- | Convert to llvm-pretty
 --
@@ -419,19 +401,12 @@ instance Downcast (Instruction a) LP.Instr where
     LOr x y               -> LP.Bit LP.Or (downcast x) (LP.typedValue (downcast y))
     BXor _ x y            -> LP.Bit LP.Xor (downcast x) (LP.typedValue (downcast y))
     LNot x                -> LP.Bit LP.Xor (downcast x) (LP.ValInteger 1)
-    -- If we decide to compile power-of-two Vecs to LLVM Vectors (instead of Arrays),
-    -- then we must use InsertElt and ExtractElt instead of InsertValue and ExtractValue.
-    InsertElement i v x   -> LP.InsertValue (downcast v) (downcast x) [i]
-      -- | vecIsPowerOfTwo v -> LP.InsertElt (downcast v) (downcast x) (constant i)
-    ExtractElement i v    -> LP.ExtractValue (downcast v) [i]
-      -- | vecIsPowerOfTwo v -> LP.ExtractElt (downcast v) (constant i)
+    InsertElement i v x   -> LP.InsertElt (downcast v) (downcast x) (constant i)
+    ExtractElement i v    -> LP.ExtractElt (downcast v) (constant i)
     ExtractValue _ i s    -> extractStruct i s
     Alloca tp             -> LP.Alloca (downcast tp) Nothing Nothing
-    Store vol p x         -> LP.Store (downcast vol) (downcast x) (downcast p) atomicity alignment
-    Load t vol p          -> LP.Load (downcast vol) (downcast t) (downcast p) atomicity alignment
-    LoadBool vol p        -> LP.Load (downcast vol) (downcast BoolPrimType) (downcast p) atomicity alignment
-    LoadPtr vol p         -> LP.Load (downcast vol) (downcast $ pointeeType $ typeOf p) (downcast p) atomicity alignment
-    LoadStruct vol p      -> LP.Load (downcast vol) (downcast $ pointeeType $ typeOf p) (downcast p) atomicity alignment
+    Store vol p x align   -> LP.Store (downcast vol) (downcast x) (downcast p) atomicity align
+    Load vol p align      -> LP.Load (downcast vol) (downcast $ pointeeType $ typeOf p) (downcast p) atomicity align
     GetElementPtr (GEP n i1 path) -> case typeOf n of
       PrimType (PtrPrimType t _) ->
         LP.GEP inbounds (downcast t) (downcast n) (downcast i1 : downcastGEPIndex constantTyped path t)
@@ -440,12 +415,12 @@ instance Downcast (Instruction a) LP.Instr where
     -- TODO: this is now a STRONG cmpxchg. Is that what was intended? I think llvm-hs defaulted to strong, but the LLVM source is very obtuse about this.
     CmpXchg _ v p x y a m -> LP.CmpXchg False (downcast v) (downcast p) (downcast x) (downcast y) (downcast (fst a)) (downcast (snd a)) (downcast m)
     AtomicRMW t v f p x a -> LP.AtomicRW (downcast v) (downcast (t,f)) (downcast p) (downcast x) (downcast (fst a)) (downcast (snd a))
-    Trunc _ t x           -> LP.Conv LP.Trunc (downcast x) (downcast t)
-    IntToBool _ x         -> LP.Conv LP.Trunc (downcast x) (LP.PrimType (LP.Integer 1))
+    Trunc _ t x           -> LP.Conv (LP.Trunc False False) (downcast x) (downcast t)
+    IntToBool _ x         -> LP.Conv (LP.Trunc False False) (downcast x) (LP.PrimType (LP.Integer 1))
     FTrunc _ t x          -> LP.Conv LP.FpTrunc (downcast x) (downcast t)
     Ext a b x             -> ext a b (downcast x)
-    BoolToInt a x         -> LP.Conv LP.ZExt (downcast x) (downcast a)
-    BoolToFP x a          -> LP.Conv LP.UiToFp (downcast a) (downcast x)
+    BoolToInt a x         -> LP.Conv (LP.ZExt False) (downcast x) (downcast a)
+    BoolToFP x a          -> LP.Conv (LP.UiToFp False) (downcast a) (downcast x)
     FExt _ t x            -> LP.Conv LP.FpExt (downcast x) (downcast t)
     FPToInt _ b x         -> float2int b (downcast x)
     IntToFP a b x         -> int2float a b (downcast x)
@@ -471,8 +446,8 @@ instance Downcast (Instruction a) LP.Instr where
       fmf :: [LP.FMF]
       fmf = fastmathFlags
 
-      inbounds :: Bool
-      inbounds = True
+      inbounds :: [LP.GEPAttr]
+      inbounds = [LP.GEP_Inbounds]
 
       atomicity :: Maybe LP.AtomicOrdering
       atomicity = Nothing
@@ -519,11 +494,6 @@ instance Downcast (Instruction a) LP.Instr where
         | signed t  = LP.Arith LP.SRem x y
         | otherwise = LP.Arith LP.URem x y
 
-      -- vecIsPowerOfTwo :: Operand (Vec n a1) -> Bool
-      -- vecIsPowerOfTwo v = case typeOf v of
-      --   PrimType (ScalarPrimType (VectorScalarType (VectorType n _))) -> popCount n == 1
-      --   _ -> internalError "Vector impossible"
-
       extractStruct :: TupleIdx s t -> Operand (Struct s) -> LP.Instr
       extractStruct ix s = LP.ExtractValue (downcast s) [fromIntegral int]
         where
@@ -534,7 +504,7 @@ instance Downcast (Instruction a) LP.Instr where
       ext :: BoundedType a -> BoundedType b -> LP.Typed LP.Value -> LP.Instr
       ext a (downcast -> b) x
         | signed a  = LP.Conv LP.SExt x b
-        | otherwise = LP.Conv LP.ZExt x b
+        | otherwise = LP.Conv (LP.ZExt False) x b
 
       float2int :: IntegralType b -> LP.Typed LP.Value -> LP.Instr
       float2int t@(downcast -> t') x
@@ -544,7 +514,7 @@ instance Downcast (Instruction a) LP.Instr where
       int2float :: IntegralType a -> FloatingType b -> LP.Typed LP.Value -> LP.Instr
       int2float a (downcast -> b) x
         | signed a  = LP.Conv LP.SiToFp x b
-        | otherwise = LP.Conv LP.UiToFp x b
+        | otherwise = LP.Conv (LP.UiToFp False) x b
 
       isNaN :: LP.Typed LP.Value -> LP.Instr
       isNaN x = LP.FCmp fmf LP.Funo x (LP.typedValue x)
@@ -553,8 +523,8 @@ instance Downcast (Instruction a) LP.Instr where
       cmp t p x (LP.Typed _ y) =
         case t of
           NumSingleType FloatingNumType{} -> LP.FCmp fastmathFlags (fp p) x y
-          _ | signed t                    -> LP.ICmp (si p) x y
-            | otherwise                   -> LP.ICmp (ui p) x y
+          _ | signed t                    -> LP.ICmp False (si p) x y
+            | otherwise                   -> LP.ICmp False (ui p) x y
         where
           fp :: Ordering -> LP.FCmpOp
           fp EQ = LP.Foeq
@@ -580,10 +550,6 @@ instance Downcast (Instruction a) LP.Instr where
           ui GT = LP.Iugt
           ui GE = LP.Iuge
 
-      pointeeType :: Type (Ptr t) -> PrimType t
-      pointeeType (PrimType (PtrPrimType tp _)) = tp
-      pointeeType _ = internalError "Ptr impossible"
-
       call :: Function Callable t -> Arguments t -> LP.Instr
       call f args = LP.Call tail fmFlags fun_ty target $ travArgs args
         where
@@ -596,7 +562,11 @@ instance Downcast (Instruction a) LP.Instr where
                   )
           trav (Body u k o) =
             case o of
-              CallAssembly asm -> error "TODO inline assembly"
+              CallAssembly asm ->
+                internalError
+                  "Inline assembly should not be used as llvm-pretty does not \
+                  \support it. For a workaround, see the solution for nanosleep \
+                  \in Data.Array.Accelerate.LLVM.PTX.Compile."
                 -- ([], downcast k, downcast u, Left  (downcast (LLVM.FunctionType ret argt False, asm)))
               CallGlobal n -> ([], fromMaybe False (downcast k), downcast u, fmfFor u, LP.ValSymbol (labelToPrettyS n))
               CallLocal n  -> ([], fromMaybe False (downcast k), downcast u, fmfFor u, LP.ValIdent (labelToPrettyI n))
@@ -614,9 +584,12 @@ instance Downcast (Instruction a) LP.Instr where
 
 
 instance Downcast (Named Instruction a) LP.Stmt where
-  downcast (x := op) = LP.Result (nameToPrettyI x) (downcast op) []
-  downcast (Do op)   = LP.Effect (downcast op) []
+  downcast (x := op) = LP.Result (nameToPrettyI x) (downcast op) [] []
+  downcast (Do op)   = LP.Effect (downcast op) [] []
 
+pointeeType :: Type (Ptr t) -> PrimType t
+pointeeType (PrimType (PtrPrimType tp _)) = tp
+pointeeType _ = internalError "Ptr impossible"
 
 instance TypeOf Instruction where
   typeOf = \case
@@ -639,14 +612,7 @@ instance TypeOf Instruction where
     InsertElement _ x _   -> typeOf x
     ExtractValue t _ _    -> PrimType t
     Alloca t              -> PrimType $ PtrPrimType t defaultAddrSpace
-    Load t _ _            -> scalar t
-    LoadBool _ _          -> PrimType BoolPrimType
-    LoadPtr _ x           -> case typeOf x of
-      PrimType (PtrPrimType t _) -> PrimType t
-      _ -> internalError "Ptr impossible"
-    LoadStruct _ x        -> case typeOf x of
-      PrimType (PtrPrimType t _) -> PrimType t
-      _ -> internalError "Ptr impossible"
+    Load _ ptr _          -> PrimType $ pointeeType $ typeOf ptr
     Store{}               -> VoidType
     GetElementPtr gep     -> typeOf gep
     Fence{}               -> VoidType

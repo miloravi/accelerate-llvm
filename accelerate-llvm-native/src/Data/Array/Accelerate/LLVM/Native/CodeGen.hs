@@ -47,6 +47,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.Base
 import Data.Array.Accelerate.LLVM.CodeGen.Environment hiding ( Empty )
 import Data.Array.Accelerate.LLVM.CodeGen.Cluster
 import Data.Array.Accelerate.LLVM.CodeGen.Default
+import Data.Array.Accelerate.LLVM.CodeGen.Loop
 import Data.Array.Accelerate.LLVM.Native.Operation
 import Data.Array.Accelerate.LLVM.Native.CodeGen.Base
 import Data.Array.Accelerate.LLVM.Native.Target
@@ -54,14 +55,14 @@ import Data.Maybe
 
 import LLVM.AST.Type.Module
 import LLVM.AST.Type.Representation
-import LLVM.AST.Type.Instruction
+import LLVM.AST.Type.Instruction as LLVM
 import LLVM.AST.Type.Instruction.Volatile
 import LLVM.AST.Type.Instruction.Atomic
 import LLVM.AST.Type.Instruction.RMW
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
 import qualified LLVM.AST.Type.Function as LLVM
 import Data.Array.Accelerate.LLVM.CodeGen.Array
-import Data.Array.Accelerate.LLVM.CodeGen.Sugar (app1, IROpenFun2 (app2))
+import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic as A
 import Data.Array.Accelerate.LLVM.Native.CodeGen.Permute (atomically)
@@ -71,7 +72,7 @@ import qualified Data.Array.Accelerate.LLVM.CodeGen.Loop as Loop
 import Data.Array.Accelerate.LLVM.Native.CodeGen.Loop
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
-import qualified Text.LLVM as LP
+import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty as LP
 import Data.Array.Accelerate.LLVM.CodeGen.Loop (imapFromStepTo)
 
 codegen :: String
@@ -146,7 +147,7 @@ codegen name env cluster args
             -- Decide whether tileCount is large enough
 
             OP_Bool isSmall <- A.lt singleType (OP_Int tileCount') $ A.liftInt 2
-            value <- instr' $ Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
+            value <- instr' $ LLVM.Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
             retval_ value
 
           setBlock finishBlock
@@ -191,23 +192,19 @@ codegen name env cluster args
           -- TODO: We can make this more precise by tracking whether arrays are
           -- only used in one tile loop. These arrays can also be stored as a
           -- single value.
-          envs''' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs''
+          envs'' <-
+            -- Binding locals on dimension 0. This is not needed for fused away
+            -- arrays, but we use the same mechanism to handle unused outputs.
+            -- This is particularly important for scanl, as we cannot fuse over
+            -- the output of a scanl (opposed to scanl1 and scanl'). In
+            -- SetOpIndices we do not set the index of the output, and that
+            -- causes it to be placed on dimension 0. Hence we need to bind it
+            -- here.
+            bindLocals 0 envs' >>=
+            bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize
           workassistLoop workassistIndex workassistFirstIndex tileCount $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
-
-            tileIdxAbsolute <-
-              -- For a scanr, convert low-to-high indices to high-to-low indices:
-              -- The first block (with tileIdx 0) should now correspond with the last
-              -- values of the array. We implement that by reversing the tile indices here.
-              if isDescending direction then do
-                i <- A.sub numType (OP_Int tileCount') (OP_Int tileIdx)
-                OP_Int j <- A.sub numType i (A.liftInt 1)
-                return j
-              else
-                return tileIdx
-            lower <- A.mul numType (OP_Int tileIdxAbsolute) (A.liftInt tileSize)
-            upper' <- A.add numType lower (A.liftInt tileSize)
-            upper <- A.min singleType upper' size
+            (_, lower, upper, _) <- tileRange (isDescending direction) (op TypeInt size) (integral TypeInt tileSize) tileCount' tileIdx
 
             -- If there is only a single tile loop (i.e. no parallel scans),
             -- then we don't generate code for a single-threaded mode:
@@ -229,7 +226,7 @@ codegen name env cluster args
                       -- Only do loop peeling if requested and when there are no nested loops.
                       -- Peeling over nested loops causes a lot of code duplication,
                       -- and is probably not worth it.
-                      [ Loop.LoopPeel | ptPeel tileLoop && null loops' ]
+                      [ Loop.LoopPeel | cpuLoopPeel (ptAnalysis tileLoop) && null loops' ]
                       -- We can use LoopNonEmpty since we
                       -- know that each tile is non-empty.
                       -- We cannot vectorize this loop (yet), as LLVM cannot vectorize loops
@@ -238,14 +235,15 @@ codegen name env cluster args
                       -- As an alternative to vectorization, we ask LLVM to interleave the loop.
                       ++ [ Loop.LoopNonEmpty, Loop.LoopInterleave ]
 
-                ptBefore tileLoop envs''''
-                Loop.loopWith ann (isDescending direction) lower upper $ \isFirst idx -> do
-                  localIdx <- A.sub numType idx lower
-                  let envs''''' = envs''''{
+                ptBefore tileLoop envs'''
+                Loop.loopWith ann (isDescending direction) (OP_Int lower) (OP_Int upper) $ \isFirst idx -> do
+                  localIdx <- A.sub numType idx (OP_Int lower)
+                  let envs'''' = envs'''{
                       envsLoopDepth = 1,
                       envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs'''',
                       envsIsFirst = isFirst,
-                      envsTileLocalIndex = localIdx
+                      envsTileLocalIndex = localIdx,
+                      envsTileStorageIndex = localIdx
                     }
                   genSequential envs''''' loops' $ ptIn tileLoop
                 ptAfter tileLoop envs''''
@@ -260,7 +258,7 @@ codegen name env cluster args
                         -- Only do loop peeling if requested and when there are no nested loops.
                         -- Peeling over nested loops causes a lot of code duplication,
                         -- and is probably not worth it.
-                        [ Loop.LoopPeel | ptPeel tileLoop && null loops'' ]
+                        [ Loop.LoopPeel | cpuLoopPeel (ptAnalysis tileLoop) && null loops'' ]
                         -- LLVM cannot vectorize loops containing scans (yet).
                         -- The first tile loop only does a reduction, others will perform a scan.
                         -- Loops containing permute (not permuteUnique) can
@@ -274,18 +272,16 @@ codegen name env cluster args
                         -- We can use LoopNonEmpty since we
                         -- know that each tile is non-empty.
                         ++ [ Loop.LoopNonEmpty ]
-                  
-                  -- _ <- putInt $ envsTileIndex envs'''' 
-                  -- putString ": From parallel tile loop\n"
 
-                  ptBefore tileLoop envs''''
-                  Loop.loopWith ann (isDescending direction) lower upper $ \isFirst idx -> do
-                    localIdx <- A.sub numType idx lower
-                    let envs''''' = envs''''{
+                  ptBefore tileLoop envs'''
+                  Loop.loopWith ann (isDescending direction) (OP_Int lower) (OP_Int upper) $ \isFirst idx -> do
+                    localIdx <- A.sub numType idx (OP_Int lower)
+                    let envs'''' = envs'''{
                         envsLoopDepth = 1,
                         envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs''',
                         envsIsFirst = isFirst,
-                        envsTileLocalIndex = localIdx
+                        envsTileLocalIndex = localIdx,
+                        envsTileStorageIndex = localIdx
                       }
                     genSequential envs''''' loops'' $ ptIn tileLoop
                   ptAfter tileLoop envs''''
@@ -316,7 +312,7 @@ codegen name env cluster args
         -- We are not using kernel memory, so no need to initialize it.
 
         OP_Bool isSmall <- A.lt singleType tileCount' $ A.liftInt 2
-        value <- instr' $ Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
+        value <- instr' $ LLVM.Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
         retval_ value
 
       setBlock finishBlock
@@ -366,9 +362,11 @@ opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
   NScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
   NScan dir -> defaultCodeGenScan dir flatOp args idxArgs
 
+type NParLoopCodeGen = ParLoopCodeGen Native CPULoopAnalysis
+
 -- Parallel code generation for one-dimensional collective operations (folds and scans).
 -- Other operations, either OpCodeGenSingle or nested deeper, are handled in opCodeGen
-parCodeGen :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (ParLoopCodeGen Native env idxEnv))
+parCodeGen :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (NParLoopCodeGen env idxEnv))
 parCodeGen descending (FlatOp NFold
     (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
     (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
@@ -431,7 +429,7 @@ parCodeGenFold
   -> Arg env (Out sh e)
   -> ExpVars idxEnv (sh, Int)
   -> ExpVars idxEnv sh
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenFold descending fun Nothing input output inputIdx outputIdx
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
   = parCodeGenFold descending fun (Just $ mkConstant tp identity) input output inputIdx outputIdx
@@ -469,20 +467,20 @@ parCodeGenFoldCommutative
   -> Arg env (Out sh e)
   -> ExpVars idxEnv (sh, Int)
   -> ExpVars idxEnv sh
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenFoldCommutative _ fun seed identity input output inputIdx outputIdx = Exists $ ParLoopCodeGen
-  False
+  (CPULoopAnalysis False)
   -- In kernel memory, store a lock (Word8) and the
   -- reduced value so far. The lock must be acquired to read or update the total value.
   -- Value 0 means unlocked, 1 is locked.
-  (mapTupR ScalarPrimType memoryTp)
+  (bufferEltsR memoryTp)
   -- Initialize kernel memory
   (\ptr envs -> do
     ptrs <- tuplePtrs memoryTp ptr
     case ptrs of
       TupRsingle _ -> internalError "Pair impossible"
       TupRpair (TupRsingle intPtr) valuePtrs -> do
-        _ <- instr' $ Store NonVolatile intPtr (scalar scalarTypeWord8 0) -- unlocked
+        _ <- instr' $ Store NonVolatile intPtr (scalar scalarTypeWord8 0) Nothing -- unlocked
         value <- llvmOfExp (compileArrayInstrEnvs envs) seed
         tupleStore tp valuePtrs value
   )
@@ -537,8 +535,9 @@ parCodeGenFoldCommutative _ fun seed identity input output inputIdx outputIdx = 
         tupleStore tp valuePtrs new
 
         -- Release the lock
-        _ <- instr' $ Fence (CrossThread, Release)
-        _ <- instr' $ Store Volatile lock (scalar scalarTypeWord8 0)
+        _ <- instr' $ LLVM.Fence (CrossThread, Release)
+        -- TODO: Change to atomic store
+        _ <- instr' $ Store Volatile lock (scalar scalarTypeWord8 0) Nothing
         return ()
   )
   -- Code after the loop
@@ -911,7 +910,7 @@ parCodeGenScan
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
   -- Code after the parallel loop
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenScan descending foldOrScan fun Nothing input index codeSeed codePre codePost codeEnd
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
   = parCodeGenScan descending foldOrScan fun (Just $ mkConstant tp identity) input index codeSeed codePre codePost codeEnd
@@ -919,18 +918,18 @@ parCodeGenScan descending foldOrScan fun Nothing input index codeSeed codePre co
     ArgArray _ (ArrayR _ tp) _ _ = input
 parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codePost codeEnd = Exists $ ParLoopCodeGen
   -- If we know an identity value, we can implement this without loop peeling
-  (isNothing identity)
+  (CPULoopAnalysis $ isNothing identity)
   -- In kernel memory, store the index of the block we must now handle and the
   -- reduced value so far. 'Handle' here means that we should now add the value
   -- of that block.
-  (mapTupR ScalarPrimType memoryTp)
+  (bufferEltsR memoryTp)
   -- Initialize kernel memory
   (\ptr envs -> do
     ptrs <- tuplePtrs memoryTp ptr
     case ptrs of
       TupRsingle _ -> internalError "Pair impossible"
       TupRpair (TupRsingle intPtr) valuePtrs -> do
-        _ <- instr' $ Store NonVolatile intPtr (scalar scalarTypeInt 0)
+        _ <- instr' $ Store NonVolatile intPtr (scalar scalarTypeInt 0) Nothing
         case seed of
           Nothing -> return ()
           Just s -> do
@@ -1028,12 +1027,12 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
         else do
           _ <- Loop.while [] TupRunit
             (\_ -> do
-              idx <- instr $ Load scalarTypeInt Volatile idxPtr
+              idx <- instr $ Load Volatile idxPtr Nothing
               A.neq singleType idx (envsTileIndex envs)
             )
             (\_ -> return OP_Unit)
             OP_Unit
-          _ <- instr' $ Fence (CrossThread, Acquire)
+          _ <- instr' $ LLVM.Fence (CrossThread, Acquire)
           return ()
 
         local <- tupleLoad tp accumVar
@@ -1078,9 +1077,9 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
         tupleStore tp valuePtrs new
 
-        _ <- instr' $ Fence (CrossThread, Release)
+        _ <- instr' $ LLVM.Fence (CrossThread, Release)
         OP_Int nextIdx <- A.add numType (envsTileIndex envs) (A.liftInt 1)
-        _ <- instr' $ Store Volatile idxPtr nextIdx
+        _ <- instr' $ Store Volatile idxPtr nextIdx Nothing
         return ()
   )
   (\_ _ _ -> return ())
@@ -1098,7 +1097,7 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (isNothing seed, \accumVar _ envs -> do
+    Just (CPULoopAnalysis $ isNothing seed, \accumVar _ envs -> do
       x <- readArray' envs input index
       if isJust seed then do
         accum <- tupleLoad tp accumVar

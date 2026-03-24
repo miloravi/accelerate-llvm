@@ -27,10 +27,11 @@ module Data.Array.Accelerate.LLVM.CodeGen.Environment
   , Gamma, GroundOperand(..), AccessGroundR(..)
   , aprjParameter, aprjParameters, aprjBuffer
   , arraySize
-  , MarshalArg, MarshalFun, MarshalEnv
+  , MarshalArg, MarshalStorageArg, MarshalFun, MarshalEnv
   , marshalScalarArg
   -- , scalarParameter, ptrParameter
   , marshalFunResultUnit
+  , declareAliasScopes, ptrAsUnalignedVecPtr
   , bindEnvFromStruct, bindEnvArgs, envStructType
   , Envs(..), initEnv, bindLocals, bindLocalsInTile
   , envsGamma, envsPrjBuffer, envsPrjParameter
@@ -49,6 +50,7 @@ import Data.Array.Accelerate.AST.Idx                            ( Idx )
 import Data.Array.Accelerate.AST.Kernel
 import Data.Array.Accelerate.Error                              ( internalError )
 import Data.Array.Accelerate.Array.Buffer
+import Data.Array.Accelerate.Representation.Elt
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Representation.Array
 import Data.Array.Accelerate.Representation.Shape
@@ -99,13 +101,35 @@ data Envs env idxEnv = Envs
   , envsTileIndex :: Operands Int
   -- The index within the tile, if this is in a parallel tiled loop
   , envsTileLocalIndex :: Operands Int
+  -- The index in thread memory where the current envsTileLocalIndex should be located.
+  -- If a tile is handled by a single thread (eg on a CPU), this should be equal to envsTileLocalIndex.
+  -- If a tile is handled by a group of thread (eg on a GPU), then each thread will handle a part of a tile.
+  -- Each thread may allocate a short array, so all threads together can store the entire tile.
+  -- This index is the index into that short array.
+  -- See IRBufferScopeTile
+  , envsTileStorageIndex :: Operands Int
   -- Whether the iteration at the current loop depth is the first iteration of
-  -- the loop If this is in a tile loop, this says if this is the first
+  -- the loop "in the current scope". The latter means the following,
+  -- depending on the backend:
+  -- If this is in a tile loop, this says if this is the first
   -- iteration of that tile loop.
+  -- If the backend is a GPU or uses a similar thread hierarchy, this says
+  -- whether this is the first value for the current thread (as a tile may be
+  -- handled by all threads in a warp or threadgroup).
   , envsIsFirst :: Operands Bool
   -- Whether the loop at the current loop depth is descending
   -- (iterating from high indices to low indices)
   , envsDescending :: Bool
+
+  -- Some additional properties for GPU code generation. Should only be used by GPU backends;
+  -- they get dummy values for CPU code generation.
+  -- The number of active threads in this warp.
+  -- When Nothing, all threads are active.
+  -- When Just, the operand gives the number N of threads in the warp that are
+  -- active. The first N threads are active, and the threads with higher lane
+  -- indices are inactive.
+  , envsGpuWarpActiveThreads :: Maybe (Operand Int32) -- The number of threads active in this warp.
+  , envsGpuActiveWarps :: Operand Int32 -- The number of warps active in this thread group
   -- The total number of tiles to be executed by all threads, if this is in a
   -- parallel tiled loop
   , envsTileCount :: Operand Int
@@ -139,8 +163,12 @@ initEnv gamma shr idxLHS iterSize iterDir localsR localLHS
       , envsIdx = PEnd
       , envsTileIndex = OP_Int $ scalar scalarTypeInt 0
       , envsTileLocalIndex = OP_Int $ scalar scalarTypeInt 0
+      , envsTileStorageIndex = OP_Int $ scalar scalarTypeInt 0
       , envsIsFirst = OP_Bool $ boolean True
       , envsDescending = False
+
+      , envsGpuWarpActiveThreads = Nothing
+      , envsGpuActiveWarps = scalar scalarType 0
       , envsTileCount = integral TypeInt 0
       }
     , reverse $ loops shr idxVars iterSize iterDir
@@ -166,16 +194,15 @@ bindLocals depth = \envs -> foldlM go envs $ envsLocal envs
       | Just _ <- prjPartial idx (envsGround envs) = return envs -- Already bound
       | otherwise = do
         -- Introduce a new mutable variable on the stack
-        ptr <- hoistAlloca $ ScalarPrimType tp
-        ptr' <- instr' $ PtrCast (PtrPrimType (ScalarPrimType tp) defaultAddrSpace) ptr
-        let value = IRBuffer ptr' defaultAddrSpace NonVolatile IRBufferScopeSingle Nothing
+        ptr <- hoistAlloca $ bufferEltR tp
+        let value = IRBuffer ptr defaultAddrSpace NonVolatile IRBufferScopeSingle Nothing
         return envs{ envsGround = partialUpdate (GroundOperandBuffer value) idx $ envsGround envs }
 
 bindLocalsInTile
   :: forall target env idxEnv.
      (forall t. Idx env (Buffer t) -> Bool)
   -> LoopDepth -> Int -> Envs env idxEnv -> CodeGen target (Envs env idxEnv)
-bindLocalsInTile needsTileArray depth tileSize = \envs -> foldlM go envs $ envsLocal envs
+bindLocalsInTile needsTileArray depth storageSize = \envs -> foldlM go envs $ envsLocal envs
   where
     go :: Envs env idxEnv -> EnvBinding LocalBufferR env -> CodeGen target (Envs env idxEnv)
     go envs (EnvBinding idx (LocalBufferR tp depth'))
@@ -184,8 +211,8 @@ bindLocalsInTile needsTileArray depth tileSize = \envs -> foldlM go envs $ envsL
       | not (needsTileArray idx) = return envs
       | otherwise = do
         -- Introduce a new mutable variable on the stack
-        ptr <- hoistAlloca $ ArrayPrimType (fromIntegral tileSize) (ScalarPrimType tp)
-        ptr' <- instr' $ PtrCast (PtrPrimType (ScalarPrimType tp) defaultAddrSpace) ptr
+        ptr <- hoistAlloca $ ArrayPrimType (fromIntegral storageSize) (bufferEltR tp)
+        ptr' <- instr' $ PtrCast (PtrPrimType (bufferEltR tp) defaultAddrSpace) ptr
         let value = IRBuffer ptr' defaultAddrSpace NonVolatile IRBufferScopeTile Nothing
         return envs{ envsGround = partialUpdate (GroundOperandBuffer value) idx $ envsGround envs }
 
@@ -297,8 +324,10 @@ arraySize :: HasCallStack => Arg genv (m sh e) -> Envs genv idxEnv -> Operands s
 arraySize (ArgArray _ (ArrayR shr _) sh _) = envsPrjParameters $ shapeExpVars shr sh
 
 type family MarshalArg a where
-  MarshalArg (Buffer e) = Ptr e
+  MarshalArg (Buffer e) = Ptr (BufferEltR e)
   MarshalArg e = e
+
+type MarshalStorageArg a = BufferEltR (MarshalArg a)
 
 -- | Converts a typed environment into a function type.
 -- For instance, (((), Int), Float) is converted to Float -> Int -> ().
@@ -310,12 +339,23 @@ type family MarshalFun env where
   MarshalFun (env, t) = MarshalArg t -> MarshalFun env
 
 type family MarshalEnv env where
-  MarshalEnv (env, t) = (MarshalEnv env, MarshalArg t)
+  MarshalEnv (env, t) = (MarshalEnv env, MarshalStorageArg t)
   MarshalEnv ()       = ()
 
 marshalFunResultUnit :: Env AccessGroundR env -> Result (MarshalFun env) :~: ()
 marshalFunResultUnit Empty = Refl
 marshalFunResultUnit (Push env _) = marshalFunResultUnit env
+
+-- Converts a pointer to a BufferEltR type to a pointer to the standard type.
+-- In case of a Vec, this may yield an unaligned pointer.
+-- We thus also report the alignment of the pointer, if it is unaligned.
+-- A Vec is only aligned to the alignment of its elements, whereas LLVM expects
+-- a higher alignment.
+ptrAsUnalignedVecPtr :: ScalarType e -> Operand (Ptr (BufferEltR e)) -> (Operand (Ptr e), Maybe Int)
+ptrAsUnalignedVecPtr (SingleScalarType tp) ptr
+  | Refl <- singleTypeBufferEltR tp = (ptr, Nothing)
+ptrAsUnalignedVecPtr (VectorScalarType tp@(VectorType _ t)) ptr =
+  (ptrCast (ScalarPrimType $ VectorScalarType tp) ptr, Just $ singleTypeSize t)
 
 bindEnvArgs
   :: forall arch env. Env AccessGroundR env
@@ -373,7 +413,7 @@ bindEnvArgs environment =
         name' = prefix ++ show freshBuffer
         name = fromString name'
         irbuffer = IRBuffer operand defaultAddrSpace NonVolatile IRBufferScopeArray alias
-        ptrType = PtrPrimType (ScalarPrimType tp) defaultAddrSpace
+        ptrType = PtrPrimType (bufferEltR tp) defaultAddrSpace
 
         mutOutCount'
           | In <- m = mutOutCount
@@ -442,9 +482,9 @@ declareAliasScopes mutOutCount = do
 envStructType :: Env AccessGroundR env -> TupR PrimType (MarshalEnv env)
 envStructType Empty = TupRunit
 envStructType (Push env (AccessGroundRscalar tp))
-  | Refl <- marshalScalarArg tp = envStructType env `TupRpair` TupRsingle (ScalarPrimType tp)
+  | Refl <- marshalScalarArg tp = envStructType env `TupRpair` TupRsingle (bufferEltR tp)
 envStructType (Push env (AccessGroundRbuffer _ tp))
-  = envStructType env `TupRpair` TupRsingle (PtrPrimType (ScalarPrimType tp) defaultAddrSpace)
+  = envStructType env `TupRpair` TupRsingle (PtrPrimType (bufferEltR tp) defaultAddrSpace)
 
 bindEnvFromStruct
   :: forall arch env. Env AccessGroundR env
@@ -474,13 +514,13 @@ bindEnvFromStruct environment =
     go _ Empty = (return (), Empty, 0, 0, 0)
     go toTupleIdx (Push env (AccessGroundRscalar tp))
       | Refl <- marshalScalarArg tp = 
-        ( instr_ (downcast $
-            namePtr := GetElementPtr (gepStruct (ScalarPrimType tp) operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
-          )
-          >> instr_ (downcast $
-            name := Load tp NonVolatile operandPtr
-          )
-          >> codegen
+        ( do
+            instr_ $ downcast $
+              namePtr := GetElementPtr (gepStruct (bufferEltR tp) operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
+            let (operandPtr', align) = ptrAsUnalignedVecPtr tp operandPtr
+            instr_ $ downcast $
+              name := Load NonVolatile operandPtr' align
+            codegen
         , gamma `Push` GroundOperandParam operand
         , freshScalar + 1
         , freshBuffer
@@ -489,7 +529,7 @@ bindEnvFromStruct environment =
       where
         (codegen, gamma, freshScalar, freshBuffer, mutOutCount) = go (toTupleIdx . TupleIdxLeft) env
         operand = LocalReference (PrimType $ ScalarPrimType tp) name
-        operandPtr = LocalReference (PrimType $ PtrPrimType (ScalarPrimType tp) defaultAddrSpace) namePtr
+        operandPtr = LocalReference (PrimType $ PtrPrimType (bufferEltR tp) defaultAddrSpace) namePtr
         name = fromString $ "param." ++ show freshScalar
         namePtr = fromString $ "param." ++ show freshScalar ++ ".ptr"
     go toTupleIdx (Push env (AccessGroundRbuffer m (tp :: ScalarType t))) =
@@ -497,7 +537,7 @@ bindEnvFromStruct environment =
           namePtr := GetElementPtr (gepStruct ptrType operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
         )
         >> instr_ (downcast $
-          name := LoadPtr NonVolatile operandPtr
+          name := Load NonVolatile operandPtr Nothing
         )
         >> annotation
         >> codegen
@@ -520,7 +560,7 @@ bindEnvFromStruct environment =
         irbuffer :: IRBuffer t
         irbuffer = IRBuffer operand defaultAddrSpace NonVolatile IRBufferScopeArray alias
         ptrType :: PrimType (MarshalArg (Buffer t))
-        ptrType = PtrPrimType (ScalarPrimType tp) defaultAddrSpace
+        ptrType = PtrPrimType (bufferEltR tp) defaultAddrSpace
 
         mutOutCount'
           | In <- m = mutOutCount
@@ -577,7 +617,7 @@ makeIntAligned cursor align = cursor + m
 nextPowerOfTwo :: Int -> Int
 nextPowerOfTwo x = 1 `shiftL` (finiteBitSize (0 :: Int) - countLeadingZeros (x - 1))
 
-marshalScalarArg :: ScalarType t -> t :~: MarshalArg t
+marshalScalarArg :: ScalarType t -> (t, BufferEltR t) :~: (MarshalArg t, MarshalStorageArg t)
 -- Pattern match to prove that 't' is not a buffer
 marshalScalarArg (VectorScalarType _) = Refl
 marshalScalarArg (SingleScalarType (NumSingleType (IntegralNumType tp))) = case tp of
