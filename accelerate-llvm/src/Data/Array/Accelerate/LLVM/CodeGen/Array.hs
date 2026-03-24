@@ -22,7 +22,7 @@ module Data.Array.Accelerate.LLVM.CodeGen.Array (
   writeBuffer,
   load, store,
 
-  tupleAlloca, tuplePtrs, tuplePtrs', tupleStore, tupleStoreArray, tupleLoad, tupleArrayGep, tupleLoadArray,
+  tupleAlloca, tuplePtrs, tuplePtrs', tupleStore, tupleLoad, tupleStoreArray, tupleLoadArray, tupleArrayGep,
 
   intOfIndex,
 
@@ -58,10 +58,10 @@ import Data.Array.Accelerate.LLVM.CodeGen.Monad
 import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic      as A
+import Data.Array.Accelerate.Representation.Type (tupleLeft, tupleRight)
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Constant        as A
 
 -- | Read a value from an array at the given index
---
 {-# INLINEABLE readArray' #-}
 readArray'
     :: forall int genv idxEnv m sh e arch.
@@ -296,45 +296,38 @@ tupleStore (TupRsingle tp) (TupRsingle ptr) value
     store NonVolatile tp ptr (op tp value) Nothing
 tupleStore _ _ _ = internalError "Tuple mismatch"
 
-tupleLoad :: forall e arch. TypeR e -> TupR Operand (Distribute Ptr e) -> CodeGen arch (Operands e)
+-- | Store a tuple value into an array of tuples at the given index
+-- 
+tupleStoreArray :: forall idx struct input arch. TypeR input 
+                                              -> Volatility
+                                              -> Operand (Ptr (SizedArray (Struct struct))) 
+                                              -> Operand idx 
+                                              -> TupleIdx struct input 
+                                              -> Operands input 
+                                              -> CodeGen arch ()
+tupleStoreArray t vol a idx structIdx v = go t a v structIdx
+  where 
+    go :: forall input'. TypeR input' 
+                      -> Operand (Ptr (SizedArray (Struct struct))) 
+                      -> Operands input' 
+                      -> TupleIdx struct input' 
+                      -> CodeGen arch ()
+    go TupRunit _ _ _ = return ()
+    go (TupRpair t1 t2) array (OP_Pair v1 v2) i = 
+      go t1 array v1 (tupleLeft i) >> go t2 array v2 (tupleRight i)
+    go (TupRsingle tp) array value i 
+      | Refl <- reprIsSingle @ScalarType @input' @Ptr tp = do
+        ptr <- instr' $ GetElementPtr $ GEP array (integral TypeWord64 0) $ GEPArray idx $ GEPStruct (ScalarPrimType tp) i GEPEmpty
+        _ <- instr' $ Store vol ptr (op tp value) Nothing
+        return ()
+
+tupleLoad :: forall e arch. TypeR e -> TupR Operand (Distribute Ptr (BufferEltR e)) -> CodeGen arch (Operands e)
 tupleLoad TupRunit _ = return OP_Unit
 tupleLoad (TupRpair t1 t2) (TupRpair p1 p2) = OP_Pair <$> tupleLoad t1 p1 <*> tupleLoad t2 p2
 tupleLoad (TupRsingle tp) (TupRsingle ptr)
   | Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr $ bufferEltR tp =
     ir tp <$> load NonVolatile tp ptr Nothing
 tupleLoad _ _ = internalError "Tuple mismatch"
-
-tupleArrayGep
-  :: forall e arch.
-     TypeR e
-  -> TupR Operand (Distribute Ptr (Distribute SizedArray (BufferEltR e)))
-  -> Operands Int32
-  -> CodeGen arch (TupR Operand (Distribute Ptr (BufferEltR e)))
-tupleArrayGep TupRunit _ _ = return TupRunit
-tupleArrayGep (TupRpair t1 t2) (TupRpair p1 p2) idx = TupRpair <$> tupleArrayGep t1 p1 idx <*> tupleArrayGep t2 p2 idx
-tupleArrayGep (TupRsingle tp) (TupRsingle ptr) (OP_Int32 idx)
-  | tp' <- bufferEltR tp
-  , Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr tp'
-  , Refl <- reprIsSingle @PrimType @(BufferEltR e) @SizedArray tp' = do
-    ptr' <- instr' $ GetElementPtr $ GEP ptr (A.num numType 0 :: Operand Int32) $ GEPArray idx GEPEmpty
-    return $ TupRsingle ptr'
-tupleArrayGep _ _ _ = internalError "Tuple mismatch"
-
-tupleArrayGep
-  :: forall e arch.
-     TypeR e
-  -> TupR Operand (Distribute Ptr (Distribute SizedArray (BufferEltR e)))
-  -> Operands Int32
-  -> CodeGen arch (TupR Operand (Distribute Ptr (BufferEltR e)))
-tupleArrayGep TupRunit _ _ = return TupRunit
-tupleArrayGep (TupRpair t1 t2) (TupRpair p1 p2) idx = TupRpair <$> tupleArrayGep t1 p1 idx <*> tupleArrayGep t2 p2 idx
-tupleArrayGep (TupRsingle tp) (TupRsingle ptr) (OP_Int32 idx)
-  | tp' <- bufferEltR tp
-  , Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr tp'
-  , Refl <- reprIsSingle @PrimType @(BufferEltR e) @SizedArray tp' = do
-    ptr' <- instr' $ GetElementPtr $ GEP ptr (A.num numType 0 :: Operand Int32) $ GEPArray idx GEPEmpty
-    return $ TupRsingle ptr'
-tupleArrayGep _ _ _ = internalError "Tuple mismatch"
 
 -- | Load a tuple value from an array of tuples at the given index of the array and the given index of the struct
 --
@@ -356,7 +349,23 @@ tupleLoadArray t vol a idx = go t a
     go (TupRsingle tp) array i 
       | Refl <- reprIsSingle @ScalarType @output' @Ptr tp = do
         ptr <- instr' $ GetElementPtr $ GEP array (integral TypeWord64 0) $ GEPArray idx $ GEPStruct (ScalarPrimType tp) i GEPEmpty
-        instr $ Load tp vol ptr
+        instr $ Load vol ptr Nothing
+
+tupleArrayGep
+  :: forall e arch.
+     TypeR e
+  -> TupR Operand (Distribute Ptr (Distribute SizedArray (BufferEltR e)))
+  -> Operands Int32
+  -> CodeGen arch (TupR Operand (Distribute Ptr (BufferEltR e)))
+tupleArrayGep TupRunit _ _ = return TupRunit
+tupleArrayGep (TupRpair t1 t2) (TupRpair p1 p2) idx = TupRpair <$> tupleArrayGep t1 p1 idx <*> tupleArrayGep t2 p2 idx
+tupleArrayGep (TupRsingle tp) (TupRsingle ptr) (OP_Int32 idx)
+  | tp' <- bufferEltR tp
+  , Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr tp'
+  , Refl <- reprIsSingle @PrimType @(BufferEltR e) @SizedArray tp' = do
+    ptr' <- instr' $ GetElementPtr $ GEP ptr (A.num numType 0 :: Operand Int32) $ GEPArray idx GEPEmpty
+    return $ TupRsingle ptr'
+tupleArrayGep _ _ _ = internalError "Tuple mismatch"
 
 -- | Convert a multidimensional array index into a linear index
 --

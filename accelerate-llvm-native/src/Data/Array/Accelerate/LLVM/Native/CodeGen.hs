@@ -211,7 +211,7 @@ codegen name env cluster args
             -- the default mode already is as fast as a single-threaded mode.
             let seqMode' = if null (ptOtherLoops tileLoops) then boolean False else seqMode
 
-            let envs'''' = envs'''{
+            let envs''' = envs''{
                 envsTileIndex = OP_Int tileIdx
               }
 
@@ -240,13 +240,13 @@ codegen name env cluster args
                   localIdx <- A.sub numType idx (OP_Int lower)
                   let envs'''' = envs'''{
                       envsLoopDepth = 1,
-                      envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs'''',
+                      envsIdx = Env.partialUpdate (op TypeInt idx) idxVar $ envsIdx envs''',
                       envsIsFirst = isFirst,
                       envsTileLocalIndex = localIdx,
                       envsTileStorageIndex = localIdx
                     }
-                  genSequential envs''''' loops' $ ptIn tileLoop
-                ptAfter tileLoop envs''''
+                  genSequential envs'''' loops' $ ptIn tileLoop
+                ptAfter tileLoop envs'''
                 return OP_Unit
               )
               -- Parallel mode
@@ -283,8 +283,8 @@ codegen name env cluster args
                         envsTileLocalIndex = localIdx,
                         envsTileStorageIndex = localIdx
                       }
-                    genSequential envs''''' loops'' $ ptIn tileLoop
-                  ptAfter tileLoop envs''''
+                    genSequential envs'''' loops'' $ ptIn tileLoop
+                  ptAfter tileLoop envs'''
                 return OP_Unit
               )
             return ()
@@ -554,9 +554,6 @@ parCodeGenFoldCommutative _ fun seed identity input output inputIdx outputIdx = 
     memoryTp = TupRsingle scalarTypeWord8 `TupRpair` tp
     ArgArray _ (ArrayR _ tp) _ _ = input
 
-data FoldOrScan = IsFold | IsScan deriving Eq
-
-
 parCodeGenScanLookback
   :: forall e sh env idxEnv.
      Bool -- Whether the loop is descending
@@ -577,7 +574,7 @@ parCodeGenScanLookback
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
   -- Code after the parallel loop
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenScanLookback descending foldOrScan fun Nothing input index codeSeed codePre codePost codeEnd
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
   = parCodeGenScanLookback descending foldOrScan fun (Just $ mkConstant tp identity) input index codeSeed codePre codePost codeEnd
@@ -585,7 +582,7 @@ parCodeGenScanLookback descending foldOrScan fun Nothing input index codeSeed co
     ArgArray _ (ArrayR _ tp) _ _ = input -- maak het een struct zodat het de waarde van iets is of  PrimTypetuple
 parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codePre codePost codeEnd = Exists $ ParLoopCodeGen
   -- If we know an identity value, we can implement this without loop peeling
-  (isNothing identity)
+  (CPULoopAnalysis $ isNothing identity)
   -- In kernel memory, store the index of the block we must now handle and the
   -- reduced value so far. 'Handle' here means that we should now add the value
   -- of that block.
@@ -712,7 +709,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
           else do
             -- Store the local result in the tile array
             tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) reductionidx local
-            _ <- instr' $ Fence (CrossThread, Release)
+            _ <- instr' $ LLVM.Fence (CrossThread, Release)
             tupleStoreArray (TupRsingle scalarTypeWord8) NonVolatile tileArray (singleEnvIndex envs) tileFlagidx reductionFlag
 
             prevIndex <- indexMin1 (envsTileIndex envs)
@@ -735,7 +732,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                   OP_Pair (OP_Pair _ curIndex) (OP_Pair curReduction hasValue) -> do
 
                     curFlag <- tupleLoadArray (TupRsingle scalarTypeWord8) Volatile tileArray (opsToOpInt curIndex) tileFlagidx
-                    _ <- instr' $ Fence (CrossThread, Acquire)
+                    _ <- instr' $ LLVM.Fence (CrossThread, Acquire)
 
 
                     A.ifThenElse (loopVartp, A.eq singleType curFlag prefixFlag)
@@ -789,7 +786,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
                 )
 
         tupleStoreArray tp NonVolatile tileArray (singleEnvIndex envs) prefixidx newPrefix
-        _ <- instr' $ Fence (CrossThread, Release)
+        _ <- instr' $ LLVM.Fence (CrossThread, Release)
         tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
 
         -- _ <- putInt $ envsTileIndex envs 
@@ -814,7 +811,7 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (isNothing seed, \accumVar _ envs -> do
+    Just (CPULoopAnalysis $ isNothing seed, \accumVar _ envs -> do
       -- A.when (return $ envsIsFirst envs) $ do 
       --   -- _ <- putInt $ envsTileIndex envs 
       --   -- putString ": From secondLoop\n"
