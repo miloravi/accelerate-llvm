@@ -633,7 +633,6 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- Code within the tile loop
   (\singleThreaded accumVar _ envs ->
     if singleThreaded then do
-      _ <- putString "From tile loop 1 (singlethreaded)"
       -- Single threaded mode. We directly perform a scan here.
       x <- readArray' envs input index
       if isJust seed then do
@@ -662,7 +661,6 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
         codePost envs new
         tupleStore tp accumVar new
     else do
-      _ <- putString "From tile loop 1 (parallel)"
       -- Parallel mode.
       -- Execute the reduce-phase of a parallel chained scan here.
       x <- readArray' envs input index
@@ -790,9 +788,6 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
         _ <- instr' $ LLVM.Fence (CrossThread, Release)
         tupleStoreArray (TupRsingle scalarTypeWord8) Volatile tileArray (singleEnvIndex envs) tileFlagidx prefixFlag -- Set the flag to 2 (prefix available)
 
-        -- _ <- putInt $ envsTileIndex envs 
-        -- putString ": From ptAfter\n"
-
   )
   (\_ _ _ -> return ())
   -- Code after the loop
@@ -813,9 +808,6 @@ parCodeGenScanLookback descending foldOrScan fun seed input index codeSeed codeP
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
     Just (CPULoopAnalysis $ isNothing seed, \accumVar _ envs -> do
-      -- A.when (return $ envsIsFirst envs) $ do 
-      --   -- _ <- putInt $ envsTileIndex envs 
-      --   -- putString ": From secondLoop\n"
       x <- readArray' envs input index
       if isJust seed then do
         accum <- tupleLoad tp accumVar
